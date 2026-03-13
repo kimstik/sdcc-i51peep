@@ -1,0 +1,76 @@
+// tests.def - Peephole rules for notUsed testbench
+//
+// Each rule has a unique <peep:N} marker in the replacement comment.
+// When the rule fires with --peep-asm, the marker appears in output .asm.
+//
+// Rules:
+//   1: carry dead after add a,%1; mov r0,a
+//   2: carry dead after add a,r0; mov r1,a  (OV/P/F0/second-writer tests)
+//   3: carry dead after clr c
+//   4: carry dead after setb c
+//   5: carry dead after cjne
+//   6: carry dead after da a
+//   7: carry dead after mov c,bit
+//   8: acc dead after mov a,%1; mov r0,a
+
+replace {
+	add	a,%1
+	mov	r0,a
+} by {
+	; <peep:1> carry dead after add
+	nop
+	mov	r0,%1
+} if notUsed('c')
+
+replace {
+	add	a,r0
+	mov	r1,a
+} by {
+	; <peep:2> carry dead after add (r0/r1 variant)
+	nop
+	mov	r1,a
+} if notUsed('c')
+
+replace {
+	clr	c
+} by {
+	; <peep:3> carry dead after clr c
+	nop
+} if notUsed('c')
+
+replace {
+	setb	c
+} by {
+	; <peep:4> carry dead after setb c
+	nop
+} if notUsed('c')
+
+replace {
+	cjne	a,%1,%2
+} by {
+	; <peep:5> carry dead after cjne
+	nop
+} if notUsed('c')
+
+replace {
+	da	a
+} by {
+	; <peep:6> carry dead after da
+	nop
+} if notUsed('c')
+
+replace {
+	mov	c,%1
+} by {
+	; <peep:7> carry dead after mov c,bit
+	nop
+} if notUsed('c')
+
+replace {
+	mov	a,%1
+	mov	r0,a
+} by {
+	; <peep:8> acc dead after mov
+	nop
+	mov	r0,%1
+} if notUsed('a')
