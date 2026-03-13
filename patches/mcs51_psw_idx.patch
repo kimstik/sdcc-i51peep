@@ -121,7 +121,7 @@
    return aln;
 --- mcs51/peep.c	2026-03-11 09:21:16.000000000 +0100
 +++ mcs51/peep.c	2026-03-12 17:00:00.000000000 +0100
-@@ -229,8 +229,20 @@
+@@ -229,12 +229,29 @@
    sym_link *ftype;
    bool banked_reg = (rIdx == R0_IDX) || (rIdx == R1_IDX) || (rIdx == R2_IDX);
  
@@ -143,7 +143,16 @@
    // let's assume calls to literally given locations use the default
    // most notably :  (*(void (*)()) 0) ();  see bug 1749275
    if (IS_VALOP (IC_LEFT (pl->ic)))
-@@ -353,14 +365,18 @@
+     return (options.model == MODEL_HUGE) && banked_reg ? S4O_ABORT : options.all_callee_saves ? S4O_CONTINUE : S4O_TERM;
++  /* PCALL: indirect call via DPTR (__sdcc_call_dptr).
++     DPL/DPH hold the call target address, not a C parameter,
++     so mcs51IsParmInCall won't catch them. */
++  if (pl->ic->op == PCALL && (rIdx == DPL_IDX || rIdx == DPH_IDX))
++    return S4O_ABORT;
+   ftype = OP_SYM_TYPE(IC_LEFT(pl->ic));
+   if (IS_FUNCPTR (ftype))
+     ftype = ftype->next;
+@@ -353,14 +370,18 @@
            if (findPushPop && strstr (p, "sp"))
              return S4O_ABORT;
  
@@ -169,7 +178,7 @@
                /* does opcode write to pReg? */
                if (bitVectBitValue (port->peep.getRegsWritten ((*pl)), rIdx))
                  return S4O_WR_OP;
-@@ -882,20 +898,26 @@
+@@ -882,20 +903,26 @@
    if (!strcmp (what, "acc"))
      return (mcs51notUsed ("a", endPl, head));
  
