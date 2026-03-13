@@ -113,15 +113,15 @@
 +      if (!strcmp (inst, "jz") || !strcmp (inst, "jnz"))
 +        aln->regsRead = bitVectSetBit (aln->regsRead, A_IDX);
 +
-+      /* Note: DPL/DPH/B implicit reads for helper calls (__gptrget, etc.)
-+         are handled by termScanAtFunc returning S4O_ABORT for unknown calls
-+         (isFunc=FALSE). No blanket marking needed here. */
++      /* Note: DPL/DPH/B/A implicit reads for helper calls (__gptrget, etc.)
++         are handled by termScanAtFunc returning S4O_ABORT for DPL/DPH/B/A
++         when isFunc=FALSE. No blanket marking needed here. */
      }
  
    return aln;
 --- mcs51/peep.c	2026-03-11 09:21:16.000000000 +0100
 +++ mcs51/peep.c	2026-03-12 17:00:00.000000000 +0100
-@@ -229,6 +229,11 @@
+@@ -229,8 +229,20 @@
    sym_link *ftype;
    bool banked_reg = (rIdx == R0_IDX) || (rIdx == R1_IDX) || (rIdx == R2_IDX);
  
@@ -131,9 +131,19 @@
 +    return S4O_ABORT;
 +
    if (!isFunc (pl))
-     return S4O_CONTINUE;
+-    return S4O_CONTINUE;
++    {
++      /* Runtime helpers (__gptrget, __gptrput, etc.) have isFunc=FALSE
++         and implicitly read DPL/DPH/B as generic pointer arguments,
++         A as data argument. Abort scan for these registers. */
++      if (rIdx == DPL_IDX || rIdx == DPH_IDX || rIdx == B_IDX || rIdx == A_IDX)
++        return S4O_ABORT;
++      return S4O_CONTINUE;
++    }
    // let's assume calls to literally given locations use the default
-@@ -353,14 +358,18 @@
+   // most notably :  (*(void (*)()) 0) ();  see bug 1749275
+   if (IS_VALOP (IC_LEFT (pl->ic)))
+@@ -353,14 +365,18 @@
            if (findPushPop && strstr (p, "sp"))
              return S4O_ABORT;
  
@@ -159,7 +169,7 @@
                /* does opcode write to pReg? */
                if (bitVectBitValue (port->peep.getRegsWritten ((*pl)), rIdx))
                  return S4O_WR_OP;
-@@ -882,20 +891,22 @@
+@@ -882,20 +898,26 @@
    if (!strcmp (what, "acc"))
      return (mcs51notUsed ("a", endPl, head));
  
@@ -168,8 +178,12 @@
 -  // todo: allow dpl, dph, and support it in removeDeadMove.
 -  if (!(what[0] == 'r' && isdigit(what[1])) && !(what[0] == 'a' && what[0] == 'r' && isdigit(what[2]))) // Allow r?
 -    return (false);
++  /* TODO: track RS0/RS1 (register bank select bits) explicitly.
++     Until then, PSW is always considered live because RS0/RS1
++     are implicitly read by every R0-R7 instruction. */
 +  if (!strcmp (what, "psw"))
-+    return (mcs51notUsed ("c", endPl, head) && mcs51notUsed ("ov", endPl, head));
++    // return (mcs51notUsed ("c", endPl, head) && mcs51notUsed ("ov", endPl, head));
++    return FALSE;
  
    _G.head = head;
 -
