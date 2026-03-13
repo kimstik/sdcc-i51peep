@@ -1,0 +1,190 @@
+--- mcs51/ralloc.h	2026-03-11 09:20:48.000000000 +0100
++++ mcs51/ralloc.h	2026-03-12 17:00:00.000000000 +0100
+@@ -34,6 +34,7 @@
+   B0_IDX, B1_IDX, B2_IDX, B3_IDX,
+   B4_IDX, B5_IDX, B6_IDX, B7_IDX,
+   CND_IDX,
++  PSW_IDX,
+   DPL_IDX, DPH_IDX, B_IDX, A_IDX,
+   END_IDX
+ };
+--- mcs51/ralloc.c	2026-03-11 09:20:48.000000000 +0100
++++ mcs51/ralloc.c	2026-03-12 17:00:00.000000000 +0100
+@@ -79,6 +79,7 @@
+   {REG_BIT, B6_IDX, REG_BIT, "b6", "b6", "bits", 6, 1},
+   {REG_BIT, B7_IDX, REG_BIT, "b7", "b7", "bits", 7, 1},
+   {REG_CND, CND_IDX, REG_CND, "C", "not_psw", "0xd0", 0, 1},
++  {REG_CND, PSW_IDX, REG_CND, "psw", "not_psw2", "0xd0", 0, 1},
+   {0, DPL_IDX, 0, "dpl", "dpl", "0x82", 0, 0},
+   {0, DPH_IDX, 0, "dph", "dph", "0x83", 0, 0},
+   {0, B_IDX, 0, "b", "b", "0xf0", 0, 0},
+@@ -102,7 +103,8 @@
+   NULL, /* B5_IDX */
+   NULL, /* B6_IDX */
+   NULL, /* B7_IDX */
+-  "c", /* CND_ID */
++  "c", /* CND_IDX */
++  "ov", /* PSW_IDX */
+   NULL, /* DPL_IDX */
+   NULL, /* DPH_IDX */
+   NULL, /* B_IDX */
+--- mcs51/main.c	2026-03-11 09:20:48.000000000 +0100
++++ mcs51/main.c	2026-03-12 17:00:00.000000000 +0100
+@@ -637,7 +637,7 @@
+   {
+     {"a",    A_IDX,   -1},
+     {"ab",   A_IDX,   B_IDX},
+-    {"ac",   CND_IDX, -1},
++    {"ac",   PSW_IDX, -1},
+     {"acc",  A_IDX,   -1},
+     {"ar0",  R0_IDX,  -1},
+     {"ar1",  R1_IDX,  -1},
+@@ -653,11 +653,11 @@
+     {"dph",  DPH_IDX, -1},
+     {"dpl",  DPL_IDX, -1},
+     {"dptr", DPL_IDX, DPH_IDX},
+-    {"f0",   CND_IDX, -1},
+-    {"f1",   CND_IDX, -1},
+-    {"ov",   CND_IDX, -1},
+-    {"p",    CND_IDX, -1},
+-    {"psw",  CND_IDX, -1},
++    {"f0",   PSW_IDX, -1},
++    {"f1",   PSW_IDX, -1},
++    {"ov",   PSW_IDX, -1},
++    {"p",    PSW_IDX, -1},
++    {"psw",  CND_IDX, PSW_IDX},
+     {"r0",   R0_IDX,  -1},
+     {"r1",   R1_IDX,  -1},
+     {"r2",   R2_IDX,  -1},
+@@ -763,10 +763,10 @@
+     {"inc",  "",  "",   "rw", ""},
+     {"jb",   "j", "",   "r",  ""},
+     {"jbc",  "j", "",  "rw",  ""},
+-    {"jc",   "j", "",   "",   ""},
++    {"jc",   "j", "r",  "",   ""},
+     {"jmp",  "j", "",  "",    ""},
+     {"jnb",  "j", "",   "r",  ""},
+-    {"jnc",  "j", "",   "",   ""},
++    {"jnc",  "j", "r",  "",   ""},
+     {"jnz",  "j", "",  "",    ""},
+     {"jz",   "j", "",  "",    ""},
+     {"lcall","j", "",   "",   ""},
+@@ -884,6 +884,49 @@
+         aln->regsRead = bitVectSetBit (aln->regsRead, CND_IDX);
+       if (strchr(opdat->pswtype,'w'))
+         aln->regsWritten = bitVectSetBit (aln->regsWritten, CND_IDX);
++
++      /* PSW_IDX tracks non-carry PSW flags (OV, AC, P, F0, F1).
++         Arithmetic instructions write OV/AC; da reads/writes AC.
++         TODO: P (parity) is updated by hardware after ANY instruction that
++         changes A (mov a, xrl a, rl a, movc, etc.), but we cannot track P
++         writes through PSW_IDX without falsely marking OV as written.
++         Proper fix: add a separate P_IDX for parity tracking. */
++      if (!strcmp(inst, "add") || !strcmp(inst, "addc") || !strcmp(inst, "subb") ||
++          !strcmp(inst, "mul") || !strcmp(inst, "div"))
++        aln->regsWritten = bitVectSetBit (aln->regsWritten, PSW_IDX);
++      if (!strcmp(inst, "da"))
++        {
++          aln->regsRead = bitVectSetBit (aln->regsRead, PSW_IDX);
++          aln->regsWritten = bitVectSetBit (aln->regsWritten, PSW_IDX);
++        }
++
++      /* movc/movx use dptr for addressing: implicit read of DPL+DPH.
++         "@a+dptr" and "@dptr" don't appear as named operands in the table,
++         so without this the notUsed('dptr') check would miss these uses. */
++      if ((!strcmp(inst, "movc") || !strcmp(inst, "movx") || !strcmp(inst, "jmp")) &&
++          (strstr(op1, "dptr") || strstr(op2, "dptr")))
++        {
++          aln->regsRead = bitVectSetBit (aln->regsRead, DPL_IDX);
++          aln->regsRead = bitVectSetBit (aln->regsRead, DPH_IDX);
++        }
++
++      /* inc dptr reads current dptr, writes new value. */
++      if (!strcmp(inst, "inc") && !strcmp(op1, "dptr"))
++        {
++          aln->regsRead    = bitVectSetBit (aln->regsRead,    DPL_IDX);
++          aln->regsRead    = bitVectSetBit (aln->regsRead,    DPH_IDX);
++          aln->regsWritten = bitVectSetBit (aln->regsWritten, DPL_IDX);
++          aln->regsWritten = bitVectSetBit (aln->regsWritten, DPH_IDX);
++        }
++
++      /* jz/jnz test the accumulator directly (MCS51: jump if A==0 / A!=0).
++         "a" does not appear in the operand text, so mark A_IDX explicitly. */
++      if (!strcmp (inst, "jz") || !strcmp (inst, "jnz"))
++        aln->regsRead = bitVectSetBit (aln->regsRead, A_IDX);
++
++      /* Note: DPL/DPH/B implicit reads for helper calls (__gptrget, etc.)
++         are handled by termScanAtFunc returning S4O_ABORT for unknown calls
++         (isFunc=FALSE). No blanket marking needed here. */
+     }
+ 
+   return aln;
+--- mcs51/peep.c	2026-03-11 09:21:16.000000000 +0100
++++ mcs51/peep.c	2026-03-12 17:00:00.000000000 +0100
+@@ -229,6 +229,11 @@
+   sym_link *ftype;
+   bool banked_reg = (rIdx == R0_IDX) || (rIdx == R1_IDX) || (rIdx == R2_IDX);
+ 
++  /* PSW RS0/RS1 select register bank; any callee may use R0-R7,
++     implicitly reading RS0/RS1. Treat PSW as live across all calls. */
++  if (rIdx == PSW_IDX)
++    return S4O_ABORT;
++
+   if (!isFunc (pl))
+     return S4O_CONTINUE;
+   // let's assume calls to literally given locations use the default
+@@ -353,14 +358,18 @@
+           if (findPushPop && strstr (p, "sp"))
+             return S4O_ABORT;
+ 
+-          /* course search */
+-          if (strstr (p, pReg + 1))
++          /* Check regsRead unconditionally: handles implicit reads that don't appear
++             in operand text (jz/jnz read A, lcall/acall read DPL/DPH/B,
++             addc/subb/rlc read CY, movc/movx read DPL/DPH). */
++          if (bitVectBitValue (port->peep.getRegsRead ((*pl)), rIdx))
++            return S4O_RD_OP;
++
++          /* Coarse search for write check only: skip if register name not in operand text.
++             For "ar0"-"ar7", search for "r0"-"r7" (assembly syntax).
++             CND_IDX/PSW_IDX bypass strstr: carry is implicit in addc/subb/rlc/add/mul. */
++          const char *searchName = (pReg[0] == 'a' && pReg[1] == 'r' && isdigit((unsigned char)pReg[2])) ? pReg + 1 : pReg;
++          if (rIdx == CND_IDX || rIdx == PSW_IDX || strstr (p, searchName))
+             {
+-              /* ok, let's have a closer look */
+-
+-              /* does opcode read from pReg? */
+-              if (bitVectBitValue (port->peep.getRegsRead ((*pl)), rIdx))
+-                return S4O_RD_OP;
+               /* does opcode write to pReg? */
+               if (bitVectBitValue (port->peep.getRegsWritten ((*pl)), rIdx))
+                 return S4O_WR_OP;
+@@ -882,20 +891,22 @@
+   if (!strcmp (what, "acc"))
+     return (mcs51notUsed ("a", endPl, head));
+ 
+-  // If we don't know what it is, assume it might be used.
+-  // todo: allow a, and support it in removeDeadMove.
+-  // todo: allow dpl, dph, and support it in removeDeadMove.
+-  if (!(what[0] == 'r' && isdigit(what[1])) && !(what[0] == 'a' && what[0] == 'r' && isdigit(what[2]))) // Allow r?
+-    return (false);
++  if (!strcmp (what, "psw"))
++    return (mcs51notUsed ("c", endPl, head) && mcs51notUsed ("ov", endPl, head));
+ 
+   _G.head = head;
+-
+   unvisitLines (_G.head);
+   cleanLabelRef();
+ 
+   char pReg[32];
+   canonicalizeRegName (pReg, sizeof (pReg), what);
+ 
++  // If we don't know what it is, assume it might be used.
++  // todo: allow a, and support it in removeDeadMove.
++  // todo: allow dpl, dph, and support it in removeDeadMove.
++  if (mcs51_regname_to_idx (pReg) < 0)
++    return (false);
++
+   bool r = removeDeadMove (pReg, endPl);
+   dbglog_deadmove (printf ("  -> %d\n", r));
+   return r;
