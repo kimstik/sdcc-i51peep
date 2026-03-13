@@ -1,0 +1,438 @@
+name: Build SDCC and run MCS51 tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      svn-rev: ${{ steps.svn-rev.outputs.rev }}
+      sha-short: ${{ steps.sha-short.outputs.sha }}
+      timestamp: ${{ steps.timestamp.outputs.ts }}
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Short SHA and timestamp
+        id: sha-short
+        run: |
+          echo "sha=$(echo ${{ github.sha }} | cut -c1-7)" >> "$GITHUB_OUTPUT"
+      - id: timestamp
+        run: echo "ts=$(date -u +'%Y%m%d_%H%M%S')" >> "$GITHUB_OUTPUT"
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential bison flex libboost-graph-dev python3 m4 autoconf subversion texinfo
+
+      - name: Get SDCC SVN revision
+        id: svn-rev
+        run: |
+          REV=$(svn info --show-item revision https://svn.code.sf.net/p/sdcc/code/trunk/sdcc)
+          echo "rev=$REV" >> "$GITHUB_OUTPUT"
+          echo "SDCC SVN revision: $REV"
+
+      - name: Cache SDCC build tree
+        uses: actions/cache@v5
+        with:
+          path: sdcc
+          key: sdcc-${{ steps.svn-rev.outputs.rev }}
+          restore-keys: |
+            sdcc-
+
+      - name: Get or update SDCC source
+        run: |
+          if [ -d sdcc/.svn ]; then
+            svn update sdcc -r ${{ steps.svn-rev.outputs.rev }}
+          else
+            rm -rf sdcc
+            svn checkout -r ${{ steps.svn-rev.outputs.rev }} \
+              https://svn.code.sf.net/p/sdcc/code/trunk/sdcc sdcc
+          fi
+
+      - name: Build SDCC
+        run: |
+          cd sdcc
+          [ -f Makefile ] || ./configure --disable-pic14-port --disable-pic16-port --disable-doc
+          make -j$(nproc)
+
+  test:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [baseline, patched]
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential bison flex libboost-graph-dev python3 m4 autoconf subversion texinfo
+
+      - name: Restore SDCC build cache
+        uses: actions/cache/restore@v5
+        with:
+          path: sdcc
+          key: sdcc-${{ needs.build.outputs.svn-rev }}
+          restore-keys: |
+            sdcc-
+
+      - name: Prepare test tree
+        run: cp -a sdcc sdcc-test
+
+      - name: Apply patches
+        if: matrix.variant == 'patched'
+        run: |
+          applied=0
+          for p in patches/*.patch; do
+            [ -f "$p" ] || continue
+            echo "Applying $p"
+            patch -d sdcc-test/src -p0 < "$p"
+            applied=$((applied + 1))
+          done
+          echo "Applied $applied patch(es)"
+
+      - name: Rebuild patched files
+        if: matrix.variant == 'patched'
+        run: make -C sdcc-test -j$(nproc)
+
+      - name: Run MCS51 regression tests (small model)
+        run: |
+          cd sdcc-test/support/regression
+          make test-mcs51-small
+
+  cross-win64:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [baseline, patched]
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential bison flex libboost-graph-dev python3 m4 autoconf subversion texinfo gcc-mingw-w64-x86-64-posix g++-mingw-w64-x86-64-posix libz-mingw-w64-dev
+
+      - name: Restore SDCC build cache
+        uses: actions/cache/restore@v5
+        with:
+          path: sdcc
+          key: sdcc-${{ needs.build.outputs.svn-rev }}
+          restore-keys: |
+            sdcc-
+
+      - name: Cache extra headers
+        id: cache-headers
+        uses: actions/cache@v5
+        with:
+          path: extra-include
+          key: extra-include-boost1.89.0-gala
+
+      - name: Install Boost and gala headers
+        if: steps.cache-headers.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p extra-include
+          cd extra-include
+          wget -q "https://github.com/boostorg/boost/releases/download/boost-1.89.0/boost-1.89.0-b2-nodocs.7z"
+          7z x boost-1.89.0-b2-nodocs.7z
+          mv boost-1.89.0/boost .
+          git clone --depth 1 https://github.com/freetdi/gala.git
+          rm -rf boost-1.89.0 boost-1.89.0-b2-nodocs.7z
+
+      - name: Prepare cross-compile tree
+        run: |
+          cp -a sdcc sdcc-cross
+          cp -a sdcc-cross/device/lib/build sdcc-cross/device/lib/build-save
+
+      - name: Apply patches
+        if: matrix.variant == 'patched'
+        run: |
+          for p in patches/*.patch; do
+            [ -f "$p" ] || continue
+            echo "Applying $p"
+            patch -d sdcc-cross/src -p0 < "$p"
+          done
+
+      - name: Cross-compile for Windows x64
+        run: |
+          cd sdcc-cross
+          export CROSSCOMPILING=1
+          export CC_FOR_BUILD=gcc
+          export HOST=x86_64-w64-mingw32
+          export CC=x86_64-w64-mingw32-gcc-posix
+          export CXX=x86_64-w64-mingw32-g++-posix
+          EXTRA="-I $(realpath ../extra-include)"
+          export TARGETCFLAGS="-s -O2 $EXTRA --static"
+          export TARGETCXXFLAGS="-s -O2 $EXTRA --static -std=c++20"
+          export TARGETLDFLAGS="-s -Wl,--stack,67108864 -static -static-libgcc -static-libstdc++"
+          ./configure \
+            --host=$HOST \
+            --prefix=/sdcc \
+            --datarootdir=/sdcc \
+            sdccconf_h_dir_separator=\\\\ \
+            --disable-device-lib \
+            --disable-sdcpp \
+            --disable-sdbinutils \
+            CFLAGS="$TARGETCFLAGS" \
+            CXXFLAGS="$TARGETCXXFLAGS" \
+            LDFLAGS="$TARGETLDFLAGS"
+          make clean
+          rm -rf device/lib/build
+          mv device/lib/build-save device/lib/build
+          make -k -j$(nproc)
+
+      - name: Collect artifacts
+        run: |
+          mkdir -p dist/bin dist/device/lib
+          cp sdcc-cross/bin/*.exe dist/bin/ 2>/dev/null || true
+          cp sdcc-cross/src/sdcc.exe dist/bin/ 2>/dev/null || true
+          cp -a sdcc-cross/device/lib/build dist/device/lib/
+          cp -a sdcc-cross/device/include dist/device/ 2>/dev/null || true
+
+      - name: Upload Windows x64 binaries
+        uses: actions/upload-artifact@v7
+        with:
+          name: sdcc-w64-r${{ needs.build.outputs.svn-rev }}-${{ needs.build.outputs.timestamp }}-${{ needs.build.outputs.sha-short }}-${{ matrix.variant }}
+          path: dist/
+
+  build-real-projects:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [baseline, patched]
+        project: [ch55xduino, ch554_sdcc, contiki, ch55x_jtag, sigrok_fx2lafw, ch552_daplink,
+                  ch552_usb_knob, ch552_usb_oled, hml_stc89, hml_8051, hml_stc12, stc_solder_iron]
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential bison flex libboost-graph-dev python3 python-is-python3 m4 autoconf automake libtool subversion texinfo
+
+      - name: Restore SDCC build cache
+        uses: actions/cache/restore@v5
+        with:
+          path: sdcc
+          key: sdcc-${{ needs.build.outputs.svn-rev }}
+          restore-keys: |
+            sdcc-
+
+      - name: Prepare build tree
+        run: cp -a sdcc sdcc-build
+
+      - name: Apply patches
+        if: matrix.variant == 'patched'
+        run: |
+          for p in patches/*.patch; do
+            [ -f "$p" ] || continue
+            patch -d sdcc-build/src -p0 < "$p"
+          done
+
+      - name: Rebuild patched SDCC
+        if: matrix.variant == 'patched'
+        run: make -C sdcc-build -j$(nproc)
+
+      - name: Install SDCC
+        run: sudo make -C sdcc-build install || true
+
+      - name: Clone and compile ${{ matrix.project }}
+        run: |
+          PROJECT="${{ matrix.project }}"
+          OUTDIR="results/$PROJECT"
+          mkdir -p "$OUTDIR"
+          ABS_OUTDIR=$(realpath "$OUTDIR")
+          collect_sdcc() {
+            find "$1" ${2:+"-maxdepth" "$2"} -type f \
+              \( -name "*.asm" -o -name "*.lst" -o -name "*.rel" -o -name "*.sym" \
+              -o -name "*.ihx" -o -name "*.hex" -o -name "*.map" -o -name "*.mem" \
+              -o -name "*.lk" -o -name "*.noi" -o -name "*.dumpcustom*" \) \
+              -exec cp {} "$ABS_OUTDIR/" \;
+          }
+          case "$PROJECT" in
+            ch55xduino)
+              git clone --depth 1 --branch ch55xduino https://github.com/DeqingSun/ch55xduino.git
+              CORES=ch55xduino/ch55xduino/ch55x/cores/ch55xduino
+              ABS_CORES=$(realpath "$CORES")
+              CHIP_INC=$(find ch55xduino -name "ch5xx.h" -printf "%h\n" 2>/dev/null | xargs -I{} dirname {} | head -1)
+              echo "ch5xx.h include parent: ${CHIP_INC:-(not found)}"
+              cd "$ABS_CORES"
+              for f in *.c; do
+                [ -f "$f" ] || continue
+                sdcc -c -mmcs51 --model-large --int-long-reent --fverbose-asm \
+                  -Ddouble=float -DCH552 -DF_CPU=16000000 \
+                  -I. ${CHIP_INC:+-I"$CHIP_INC"} "$f" || true
+              done
+              collect_sdcc . 1
+              cd -
+              ;;
+            ch554_sdcc)
+              git clone --depth 1 https://github.com/Blinkinlabs/ch554_sdcc.git
+              ABS_INCDIR=$(realpath ch554_sdcc/include)
+              for d in ch554_sdcc/examples/*/; do
+                [ -d "$d" ] || continue
+                name=$(basename "$d")
+                for f in "$d"*.c; do
+                  [ -f "$f" ] || continue
+                  base=$(basename "$f" .c)
+                  cp "$f" "$ABS_OUTDIR/${name}__${base}.c"
+                  cd "$ABS_OUTDIR"
+                  sdcc -c -mmcs51 --model-small --fverbose-asm \
+                    -DFREQ_SYS=12000000 \
+                    -I"$ABS_INCDIR" \
+                    "${name}__${base}.c" || true
+                  rm -f "${name}__${base}.c"
+                  cd -
+                done
+              done
+              ;;
+            contiki)
+              git clone --depth 1 https://github.com/contiki-os/contiki.git
+              ABS_CTK=$(realpath contiki)
+              INC="-I$ABS_CTK -I$ABS_CTK/core -I$ABS_CTK/platform/cc2530dk -I$ABS_CTK/cpu/cc253x -I$ABS_CTK/cpu/cc253x/cc2530dk"
+              cd "$ABS_OUTDIR"
+              for f in \
+                "$ABS_CTK"/cpu/cc253x/*.c \
+                "$ABS_CTK"/platform/cc2530dk/*.c; do
+                [ -f "$f" ] || continue
+                sdcc -c -mmcs51 --model-large --stack-auto --fverbose-asm $INC "$f" 2>/dev/null || true
+              done
+              rm -f "$ABS_OUTDIR"/*.c
+              cd -
+              ;;
+            ch55x_jtag)
+              git clone --recurse-submodules --depth 1 https://github.com/diodep/ch55x_jtag.git
+              cd ch55x_jtag/src
+              make EXTRA_FLAGS="--opt-code-speed --fverbose-asm" || true
+              collect_sdcc . 1
+              cd ../..
+              ;;
+            sigrok_fx2lafw)
+              git clone --recurse-submodules --depth 1 https://github.com/sigrokproject/sigrok-firmware-fx2lafw.git
+              cd sigrok-firmware-fx2lafw
+              ./autogen.sh
+              ./configure
+              make || true
+              collect_sdcc .
+              cd ..
+              ;;
+            ch552_daplink)
+              git clone --depth 1 https://github.com/wagiminator/CH552-DAPLink.git
+              cd CH552-DAPLink/software
+              make all || true
+              collect_sdcc . 2
+              cd ../..
+              ;;
+            ch552_usb_knob)
+              git clone --depth 1 https://github.com/wagiminator/CH552-USB-Knob.git
+              for d in CH552-USB-Knob/software/*/; do
+                [ -f "$d/makefile" ] || continue
+                cd "$d"
+                make all || true
+                collect_sdcc . 2
+                cd -
+              done
+              ;;
+            ch552_usb_oled)
+              git clone --depth 1 https://github.com/wagiminator/CH552-USB-OLED.git
+              for d in CH552-USB-OLED/software/*/; do
+                [ -f "$d/makefile" ] || continue
+                cd "$d"
+                make all || true
+                collect_sdcc . 2
+                cd -
+              done
+              ;;
+            hml_stc89)
+              git clone --depth 1 https://github.com/MCU-ZHISHAN-IoT/HML_FwLib_STC89.git
+              cd HML_FwLib_STC89
+              make MCU=stc89c52rc all || true
+              collect_sdcc .
+              cd ..
+              ;;
+            hml_8051)
+              git clone --depth 1 https://github.com/MCU-ZHISHAN-IoT/HML_FwLib_8051.git
+              cd HML_FwLib_8051
+              make MCU=at89s52 all || true
+              collect_sdcc .
+              cd ..
+              ;;
+            hml_stc12)
+              git clone --depth 1 https://github.com/IOsetting/HML_FwLib_STC12.git
+              ABS_REPO=$(realpath HML_FwLib_STC12)
+              cd "$ABS_OUTDIR"
+              find "$ABS_REPO" -name "*.c" | while read f; do
+                sdcc -c -mmcs51 --model-small --fverbose-asm -I"$ABS_REPO/inc" "$f" 2>/dev/null || true
+              done
+              rm -f "$ABS_OUTDIR"/*.c
+              cd -
+              ;;
+            stc_solder_iron)
+              git clone --depth 1 https://github.com/atc1441/ATC_stc_solder_iron.git
+              cd ATC_stc_solder_iron
+              sdcc -c -mmcs51 --model-small --fverbose-asm -Isrc src/main.c 2>/dev/null || true
+              collect_sdcc . 1
+              cd ..
+              ;;
+          esac
+          echo "$PROJECT: $(ls "$OUTDIR"/* 2>/dev/null | wc -l) files"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: projects-build-${{ matrix.project }}-${{ matrix.variant }}
+          path: results/
+          if-no-files-found: error
+
+  blob:
+    needs: [build, build-real-projects]
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Download baseline
+        uses: actions/download-artifact@v8
+        with:
+          pattern: projects-build-*-baseline
+          path: blob/baseline
+          merge-multiple: true
+
+      - name: Download patched
+        uses: actions/download-artifact@v8
+        with:
+          pattern: projects-build-*-patched
+          path: blob/patched
+          merge-multiple: true
+
+      - name: Upload combined blob
+        uses: actions/upload-artifact@v7
+        with:
+          name: artifacts-blob-r${{ needs.build.outputs.svn-rev }}-${{ needs.build.outputs.timestamp }}-${{ needs.build.outputs.sha-short }}
+          path: blob/
+
+      - name: Delete intermediate artifacts
+        run: |
+          gh api repos/${{ github.repository }}/actions/artifacts \
+            --jq '.artifacts[] | select(.name | startswith("projects-build-")) | .id' \
+          | while read id; do
+            gh api --method DELETE repos/${{ github.repository }}/actions/artifacts/$id
+          done
+        env:
+          GH_TOKEN: ${{ github.token }}
