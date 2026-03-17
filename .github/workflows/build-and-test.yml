@@ -67,7 +67,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        variant: [baseline, patched]
+        variant: [baseline, patched, new_peep]
 
     steps:
       - uses: actions/checkout@v6
@@ -89,7 +89,7 @@ jobs:
         run: cp -a sdcc sdcc-test
 
       - name: Apply patches
-        if: matrix.variant == 'patched'
+        if: matrix.variant != 'baseline'
         run: |
           applied=0
           for p in patches/*.patch; do
@@ -100,8 +100,12 @@ jobs:
           done
           echo "Applied $applied patch(es)"
 
+      - name: Append new peephole rules
+        if: matrix.variant == 'new_peep'
+        run: cat peep_mcs51.def >> sdcc-test/src/mcs51/peeph.def
+
       - name: Rebuild patched files
-        if: matrix.variant == 'patched'
+        if: matrix.variant != 'baseline'
         run: make -C sdcc-test -j$(nproc)
 
       - name: Run MCS51 regression tests (small model)
@@ -208,16 +212,17 @@ jobs:
           name: sdcc-w64-r${{ needs.build.outputs.svn-rev }}-${{ needs.build.outputs.timestamp }}-${{ needs.build.outputs.sha-short }}-${{ matrix.variant }}
           path: dist/
 
-  build-real-projects:
+  boil:
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        variant: [baseline, patched]
+        variant: [baseline, patched, new_peep]
         project: [ch55xduino, ch554_sdcc, contiki, ch55x_jtag, sigrok_fx2lafw, ch552_daplink,
-                  ch552_usb_knob, ch552_usb_oled, hml_stc89, hml_8051, hml_stc12, stc_solder_iron]
+                  ch552_usb_knob, ch552_usb_oled, hml_stc89, hml_8051, hml_stc12, stc_solder_iron,
+                  stc_diyclock, fwlib_stc8, 8051_examples, hd44780, usb_blaster_ch552]
 
     steps:
       - uses: actions/checkout@v6
@@ -239,19 +244,37 @@ jobs:
         run: cp -a sdcc sdcc-build
 
       - name: Apply patches
-        if: matrix.variant == 'patched'
+        if: matrix.variant != 'baseline'
         run: |
           for p in patches/*.patch; do
             [ -f "$p" ] || continue
             patch -d sdcc-build/src -p0 < "$p"
           done
 
+      - name: Append new peephole rules
+        if: matrix.variant == 'new_peep'
+        run: cat peep_mcs51.def >> sdcc-build/src/mcs51/peeph.def
+
       - name: Rebuild patched SDCC
-        if: matrix.variant == 'patched'
+        if: matrix.variant != 'baseline'
         run: make -C sdcc-build -j$(nproc)
 
       - name: Install SDCC
         run: sudo make -C sdcc-build install || true
+
+      - name: Wrap SDCC for verbose peephole output
+        run: |
+          SDCC_BIN=$(command -v sdcc)
+          sudo mv "$SDCC_BIN" "${SDCC_BIN}.real"
+          printf '%s\n' \
+            '#!/bin/bash' \
+            'args=()' \
+            'for a in "$@"; do' \
+            '  [ "$a" != "--no-peep-comments" ] && args+=("$a")' \
+            'done' \
+            'exec -a sdcc "'"${SDCC_BIN}.real"'" --fverbose-asm ${SDCC_EXTRA_FLAGS:+$SDCC_EXTRA_FLAGS} "${args[@]}"' \
+            | sudo tee "$SDCC_BIN" > /dev/null
+          sudo chmod +x "$SDCC_BIN"
 
       - name: Clone and compile ${{ matrix.project }}
         run: |
@@ -259,6 +282,10 @@ jobs:
           OUTDIR="results/$PROJECT"
           mkdir -p "$OUTDIR"
           ABS_OUTDIR=$(realpath "$OUTDIR")
+          SAFE_REGBANK="ch55xduino ch554_sdcc ch55x_jtag sigrok_fx2lafw ch552_daplink ch552_usb_knob ch552_usb_oled usb_blaster_ch552"
+          if [[ "${{ matrix.variant }}" != "baseline" ]] && echo "$SAFE_REGBANK" | grep -qw "$PROJECT"; then
+            export SDCC_EXTRA_FLAGS="--fixed-regbank"
+          fi
           collect_sdcc() {
             find "$1" ${2:+"-maxdepth" "$2"} -type f \
               \( -name "*.asm" -o -name "*.lst" -o -name "*.rel" -o -name "*.sym" \
@@ -391,6 +418,50 @@ jobs:
               collect_sdcc . 1
               cd ..
               ;;
+            stc_diyclock)
+              git clone --depth 1 https://github.com/zerog2k/stc_diyclock.git
+              cd stc_diyclock/src
+              for f in *.c; do sdcc -c -mmcs51 --model-small --std-c99 -I. "$f" 2>/dev/null || true; done
+              collect_sdcc . 1
+              cd ../..
+              ;;
+            fwlib_stc8)
+              git clone --depth 1 https://github.com/IOsetting/FwLib_STC8.git
+              cd FwLib_STC8
+              INCS="-Iinclude -Iinclude/fw_hal -DSTC8H1K08"
+              for f in src/*.c; do sdcc -c -mmcs51 --model-small --std-c99 $INCS "$f" 2>/dev/null || true; done
+              for d in demo/adc demo/timer demo/uart demo/spi demo/i2c demo/iap; do
+                for f in "$d"/*.c; do [ -f "$f" ] && sdcc -c -mmcs51 --model-small --std-c99 $INCS -I"$d" "$f" 2>/dev/null || true; done
+              done
+              collect_sdcc . 2
+              cd ..
+              ;;
+            8051_examples)
+              git clone --depth 1 https://github.com/hungtcs-lab/8051-examples.git
+              cd 8051-examples
+              find . -name '*.c' | while read f; do
+                d=$(dirname "$f")
+                sdcc -c -mmcs51 --model-small --std-c99 -I"$d" "$f" 2>/dev/null || true
+              done
+              collect_sdcc . 4
+              cd ..
+              ;;
+            hd44780)
+              git clone --depth 1 https://github.com/apachiww/hd44780_for_sdcc_51.git
+              cd hd44780_for_sdcc_51
+              for f in src/*.c examples/*.c; do
+                [ -f "$f" ] && sdcc -c -mmcs51 --model-small --std-c99 -Iinc -Isrc "$f" 2>/dev/null || true
+              done
+              collect_sdcc . 2
+              cd ..
+              ;;
+            usb_blaster_ch552)
+              git clone --depth 1 https://github.com/rtek1000/USB-Blaster_CH552.git
+              cd USB-Blaster_CH552
+              make EXTRA_FLAGS="--opt-code-speed --fverbose-asm" || true
+              collect_sdcc . 1
+              cd ..
+              ;;
           esac
           echo "$PROJECT: $(ls "$OUTDIR"/* 2>/dev/null | wc -l) files"
 
@@ -402,7 +473,7 @@ jobs:
           if-no-files-found: error
 
   blob:
-    needs: [build, build-real-projects]
+    needs: [build, boil]
     runs-on: ubuntu-latest
     permissions:
       actions: write
@@ -419,6 +490,13 @@ jobs:
         with:
           pattern: projects-build-*-patched
           path: blob/patched
+          merge-multiple: true
+
+      - name: Download new_peep
+        uses: actions/download-artifact@v8
+        with:
+          pattern: projects-build-*-new_peep
+          path: blob/new_peep
           merge-multiple: true
 
       - name: Upload combined blob
