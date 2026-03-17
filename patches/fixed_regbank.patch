@@ -1,0 +1,32 @@
+--- SDCCglobl.h	2026-03-11 09:20:48.000000000 +0100
++++ SDCCglobl.h	2026-03-12 17:00:00.000000000 +0100
+@@ -288,6 +288,7 @@
+     int tini_libid;             /* library ID for TINI */
+     int protect_sp_update;      /* DS390 - will disable interrupts during ESP:SP updates */
+     int parms_in_bank1;         /* DS390 - use reg bank1 to pass parameters */
++    int fixedRegbank;           /* MCS51 - assume fixed register bank, skip mov psw,#0x00 in ISR */
+     int stack_size;             /* MCS51/DS390 - Tells the linker to allocate this space for stack */
+     int acall_ajmp;             /* MCS51 - Use acall/ajmp instead of lcall/ljmp */
+     int no_ret_without_call;    /* MCS51 - Do not use ret independent of acall/lcall */
+--- SDCCmain.c	2026-03-11 09:20:48.000000000 +0100
++++ SDCCmain.c	2026-03-12 17:00:00.000000000 +0100
+@@ -223,6 +223,7 @@
+   {0,   OPTION_OPT_CODE_SIZE, NULL, "Optimize for code size rather than speed"},
+   {0,   OPTION_MAX_ALLOCS_PER_NODE, &options.max_allocs_per_node, "Maximum number of register assignments considered at each node of the tree decomposition", CLAT_INTEGER},
+   {0,   "--no-reg-params", &options.noRegParams, "On some ports, disable passing some parameters in registers"},
++  {0,   "--fixed-regbank", &options.fixedRegbank, "MCS51: assume fixed register bank (no __using), skip mov psw in ISR prologue"},
+   {0,   "--nostdlibcall", &optimize.noStdLibCall, "Disable optimization of calls to standard library"},
+   {0,   "--nooverlay", &options.noOverlay, "Disable overlaying leaf function auto variables"},
+   {0,   OPTION_NO_PURITY, NULL, "Disable optimizations of pure functions"},
+--- mcs51/gen.c	2026-03-11 09:20:48.000000000 +0100
++++ mcs51/gen.c	2026-03-12 17:00:00.000000000 +0100
+@@ -4512,7 +4512,8 @@
+       if (!switchedPSW)
+         {
+           emitpush ("psw");
+-          emitcode ("mov", "psw,#!constbyte", (FUNC_REGBANK (ftype) << 3) & 0x00ffu);
++          if (!options.fixedRegbank || FUNC_REGBANK (ftype))
++            emitcode ("mov", "psw,#!constbyte", (FUNC_REGBANK (ftype) << 3) & 0x00ffu);
+         }
+     }
+   else
