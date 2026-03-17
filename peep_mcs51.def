@@ -1,0 +1,590 @@
+// New peephole rules for MCS51 - supplement to src/mcs51/peeph.def
+// Rule numbers 1000+ to avoid collisions with existing SDCC rules
+// Append to peeph.def or use with --peep-file flag
+
+// ---------------------------------------------------------------------------
+// Idata post-increment/decrement collapse (DISABLED)
+// Already covered by upstream peephole rules 133, 134, 174.c in peeph.def.
+// Pattern never appears in 17-project corpus (0 hits).
+// ---------------------------------------------------------------------------
+
+//replace {
+//	mov	r0,%1
+//	mov	a,@r0
+//	mov	r0,%1
+//	inc	a
+//	mov	@r0,a
+//} by {
+//	;	<rule 1000a idata post-increment collapsed to inc @r0>
+//	mov	r0,%1
+//	inc	@r0
+//} if notUsed('a'), operandsLiteral(%1)
+//
+//replace {
+//	mov	r0,%1
+//	mov	a,@r0
+//	mov	r0,%1
+//	dec	a
+//	mov	@r0,a
+//} by {
+//	;	<rule 1000b idata post-decrement collapsed to dec @r0>
+//	mov	r0,%1
+//	dec	@r0
+//} if notUsed('a'), operandsLiteral(%1)
+//
+//replace {
+//	mov	r1,%1
+//	mov	a,@r1
+//	mov	r1,%1
+//	inc	a
+//	mov	@r1,a
+//} by {
+//	;	<rule 1000c idata post-increment collapsed to inc @r1>
+//	mov	r1,%1
+//	inc	@r1
+//} if notUsed('a'), operandsLiteral(%1)
+//
+//replace {
+//	mov	r1,%1
+//	mov	a,@r1
+//	mov	r1,%1
+//	dec	a
+//	mov	@r1,a
+//} by {
+//	;	<rule 1000d idata post-decrement collapsed to dec @r1>
+//	mov	r1,%1
+//	dec	@r1
+//} if notUsed('a'), operandsLiteral(%1)
+
+// ---------------------------------------------------------------------------
+// Boolean test of A into carry
+// cjne a,#0x01 sets C=(A<1)=(A==0); cpl c flips -> C=(A!=0)
+// add a,#0xff: C=1 iff A!=0 (mathematically equivalent)
+// Saves 2 bytes per occurrence
+// 26 hits, 4/17 projects
+// ---------------------------------------------------------------------------
+
+replace {
+	cjne	a,#0x01,%1
+%1:
+	cpl	c
+} by {
+	;	<rule 1001 boolean test via cjne/cpl replaced by add>
+	add	a,#0xff
+} if notUsed('a'), labelRefCount(%1 1)
+
+// ---------------------------------------------------------------------------
+// Eliminate accumulator as intermediate for direct-to-register moves
+// mov a,direct; mov dest,a -> mov dest,direct (valid for Rn and direct dest)
+// Saves 1 byte per occurrence
+// Found in: hml_stc12 (16 occ), hml_8051 (8 occ) = 24 total
+// ---------------------------------------------------------------------------
+
+// dpl
+replace {
+	mov	a,dpl
+	mov	%1,a
+} by {
+	;	<rule 1002a dpl loaded directly into %1>
+	mov	%1,dpl
+} if notUsed('a'), notSame(%1 '@r0' '@r1')
+
+// dph
+replace {
+	mov	a,dph
+	mov	%1,a
+} by {
+	;	<rule 1002b dph loaded directly into %1>
+	mov	%1,dph
+} if notUsed('a'), notSame(%1 '@r0' '@r1')
+
+// ---------------------------------------------------------------------------
+// Load-modify-store collapse for increment/decrement
+// mov a,X; inc a; mov X,a -> inc X (works for Rn, direct, @Ri)
+// Saves 2 bytes per occurrence
+// Found in: ch552_usb_knob (3 occ), general codegen pattern
+// ---------------------------------------------------------------------------
+
+// increment
+replace {
+	mov	a,%1
+	inc	a
+	mov	%1,a
+} by {
+	;	<rule 1003a load-increment-store collapsed to inc>
+	inc	%1
+} if notUsed('a'), notVolatile(%1)
+
+// decrement
+replace {
+	mov	a,%1
+	dec	a
+	mov	%1,a
+} by {
+	;	<rule 1003b load-decrement-store collapsed to dec>
+	dec	%1
+} if notUsed('a'), notVolatile(%1)
+
+// ---------------------------------------------------------------------------
+// Redundant accumulator reload after non-clobbering instruction
+// mov rN,a; <instr not changing A>; mov a,rN -> mov rN,a; <instr>
+// Saves 1 byte per occurrence
+// Found in: ch552_daplink (13 occ), sigrok_fx2lafw (2 occ) = 15 total
+// ---------------------------------------------------------------------------
+
+// middle instruction is movx @dptr,a (xdata write, A unchanged)
+replace {
+	mov	%1,a
+	movx	@dptr,a
+	mov	a,%1
+} by {
+	;	<rule 1004a redundant A reload after movx removed>
+	mov	%1,a
+	movx	@dptr,a
+} if notVolatile(%1)
+
+// ---------------------------------------------------------------------------
+// Redundant clr a after xdata zero-fill
+// clr a; movx @dptr,a doesn't change A, so subsequent clr a is redundant
+// Saves 1 byte per occurrence
+// Found in: sigrok_fx2lafw (11 occ)
+// ---------------------------------------------------------------------------
+
+// immediate redundant clr a
+replace {
+	clr	a
+	movx	@dptr,a
+	clr	a
+} by {
+	;	<rule 1005a redundant clr a after zero-write removed>
+	clr	a
+	movx	@dptr,a
+}
+
+// with inc dptr between writes
+replace {
+	clr	a
+	movx	@dptr,a
+	inc	dptr
+	clr	a
+} by {
+	;	<rule 1005b redundant clr a after zero-write+inc removed>
+	clr	a
+	movx	@dptr,a
+	inc	dptr
+}
+
+// ---------------------------------------------------------------------------
+// Dead duplicate ret
+// Saves 1 byte per occurrence
+// Found in: hml_8051 (2 occ)
+// RISK: computed jumps (jmp @a+dptr) may target the second ret without a label
+// ---------------------------------------------------------------------------
+// replace {
+// 	ret
+// 	ret
+// } by {
+// 	;	peephole 906 duplicate ret removed
+// 	ret
+// }
+
+// ---------------------------------------------------------------------------
+// Dead carry store before boolean conversion
+// mov bit,c; clr a; rlc a -> clr a; rlc a (carry save is dead)
+// Saves 2 bytes per occurrence
+// Found in: hml_stc12 (8 occ, 16 bytes total)
+// ---------------------------------------------------------------------------
+
+replace {
+	mov	%1,c
+	clr	a
+	rlc	a
+} by {
+	;	<rule 1006 dead carry store removed before rlc>
+	clr	a
+	rlc	a
+} if notUsed(%1)
+
+// ---------------------------------------------------------------------------
+// Double div ab with same operands
+// Second div is redundant - quotient in A and remainder in B already available
+// Saves 4 bytes per occurrence
+// Found in: contiki (1 occ, 4 bytes total)
+// ---------------------------------------------------------------------------
+
+replace {
+	mov	b,%1
+	mov	a,%2
+	div	ab
+	mov	%3,a
+	mov	b,%1
+	mov	a,%2
+	div	ab
+	mov	%4,b
+} by {
+	;	<rule 1007 duplicate div ab eliminated>
+	mov	b,%1
+	mov	a,%2
+	div	ab
+	mov	%3,a
+	mov	%4,b
+} if notSame(%3 'b')
+
+// ---------------------------------------------------------------------------
+// Ones complement shortcut: 0xFF - x == ~x
+// mov a,#0xff; clr c; subb a,%1 -> mov a,%1; cpl a
+// Saves 3 bytes per occurrence
+// Found in: contiki (1 occ, 3 bytes total)
+// ---------------------------------------------------------------------------
+
+replace {
+	mov	a,#0xff
+	clr	c
+	subb	a,%1
+} by {
+	;	<rule 1008 0xFF minus %1 simplified to cpl>
+	mov	a,%1
+	cpl	a
+} if notUsed('c'), notSame(%1 'a' 'acc')
+
+// ---------------------------------------------------------------------------
+// Dead zero-extend NOP (uint16 cast artifact)
+// mov tmp,#0x00; orl dest,a; mov a,tmp; orl dest2,a
+// Third instr loads 0 into A, fourth ORs 0 into dest2 = NOP
+// First instr only exists for the third, so also dead
+// Saves 3 instructions per occurrence
+// Found in: ch552_usb_knob (4 occ, ~12 bytes total)
+// ---------------------------------------------------------------------------
+
+replace {
+	mov	%1,#0x00
+	orl	%2,a
+	mov	a,%1
+	orl	%3,a
+} by {
+	;	<rule 1009 dead zero-extend OR removed>
+	orl	%2,a
+} if notUsed(%1 'a'), notSame(%1 %2), notSame(%1 'a' 'acc')
+
+// ---------------------------------------------------------------------------
+// Bit-mask OR merge via register
+// anl a,#N; mov tmp,a; mov a,src; orl a,tmp -> anl a,#N; orl a,src
+// OR is commutative, eliminates temp register round-trip
+// Saves 2 bytes per occurrence
+// Found in: hml_8051 (1 occ, 2 bytes total)
+// ---------------------------------------------------------------------------
+
+replace {
+	anl	a,#%1
+	mov	%2,a
+	mov	a,%3
+	orl	a,%2
+} by {
+	;	<rule 1010 bit-mask merge via register eliminated>
+	anl	a,#%1
+	orl	a,%3
+} if notUsed(%2), notSame(%2 %3), notSame(%2 'a' 'acc')
+
+// ---------------------------------------------------------------------------
+// Sequential DPTR increment collapse
+// mov dptr,#(addr+N); movx; mov dptr,#(addr+N+1) -> inc dptr
+// Uses 'tail' flag: apply at last match, so chains collapse from end.
+// With 'restart', one rule handles arbitrary-length sequences.
+// Requires: sdcc_peephole_conditions.patch (adds operandOffset + tail flag)
+//
+// operandOffset arg order: setFromConditionArgs uses addSetHead (LIFO),
+// so 'N' %base %target yields op[0]=target, op[1]=base, op[2]=N.
+// ---------------------------------------------------------------------------
+
+// sequential xdata access - collapse mov dptr to inc dptr
+// movx %3,%4 matches both @dptr,a (write) and a,@dptr (read).
+// movx never modifies dptr on any 8051 variant.
+// 24 hits, 5/17 projects. Chains up to 5 deep (USB descriptor writes)
+replace tail restart {
+	mov	dptr,%1
+	movx	%3,%4
+	mov	dptr,%2
+} by {
+	;	<rule 1012 sequential dptr collapsed to inc>
+	mov	dptr,%1
+	movx	%3,%4
+	inc	dptr
+} if operandOffset('1' %1 %2)
+
+// sequential xdata read with register save
+// mov dptr / movx a,@dptr / mov Rn,a / mov dptr -> inc dptr
+// 1 hit, 1/17 projects (multi-byte struct reads)
+replace tail restart {
+	mov	dptr,%1
+	movx	a,@dptr
+	mov	%3,a
+	mov	dptr,%2
+} by {
+	;	<rule 1012d sequential dptr read+reg collapsed to inc>
+	mov	dptr,%1
+	movx	a,@dptr
+	mov	%3,a
+	inc	dptr
+} if operandOffset('1' %1 %2)
+
+// sequential xdata write from register or immediate
+// mov dptr / mov a,%3 / movx @dptr,a / mov dptr -> inc dptr
+// %3 matches both Rn and #imm
+// 14 hits, 4/17 projects. %3 captures r0-r7 and #imm uniformly
+replace tail restart {
+	mov	dptr,%1
+	mov	a,%3
+	movx	@dptr,a
+	mov	dptr,%2
+} by {
+	;	<rule 1012e sequential dptr reg+write collapsed to inc>
+	mov	dptr,%1
+	mov	a,%3
+	movx	@dptr,a
+	inc	dptr
+} if operandOffset('1' %1 %2)
+
+// sequential xdata zero-fill (clr a between mov dptr and movx)
+// Base 1012 doesn't match: clr a between mov dptr and movx breaks 3-line pattern.
+// 1012e doesn't match: clr a is not mov a,%3.
+// 12 hits, 7/17 projects. Chains benefit from rule 1005b after 1012f.
+replace tail restart {
+	mov	dptr,%1
+	clr	a
+	movx	@dptr,a
+	mov	dptr,%2
+} by {
+	;	<rule 1012f sequential dptr zero-fill collapsed to inc>
+	mov	dptr,%1
+	clr	a
+	movx	@dptr,a
+	inc	dptr
+} if operandOffset('1' %1 %2)
+
+// ---------------------------------------------------------------------------
+// CANDIDATE RULES (not yet implemented)
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Redundant DPTR reload after xdata read + conditional jump
+// mov dptr,#ADDR / movx a,@dptr / jX ..,label / mov dptr,#ADDR
+// Last mov dptr is redundant: conditional jumps don't modify dptr.
+// 3 hits, 3/17 projects (consecutive-line matches only; pattern with
+// intervening instructions between movx and jX is common but not peephole-tractable).
+// ---------------------------------------------------------------------------
+
+// jb/jnb variant (two operands: bit,label)
+replace {
+	mov	dptr,%1
+	movx	a,@dptr
+	%9	%2,%3
+	mov	dptr,%1
+} by {
+	;	<rule 1014a redundant dptr reload after bit test removed>
+	mov	dptr,%1
+	movx	a,@dptr
+	%9	%2,%3
+} if same(%9 'jb' 'jnb' 'jbc' 'djnz'), notSame(%2 'dpl' 'dph' '0x82' '0x83' '130' '131')	//FEATURE request: symbol normalization
+
+// jz/jnz variant (one operand: label)
+replace {
+	mov	dptr,%1
+	movx	a,@dptr
+	%9	%2
+	mov	dptr,%1
+} by {
+	;	<rule 1014b redundant dptr reload after zero test removed>
+	mov	dptr,%1
+	movx	a,@dptr
+	%9	%2
+} if same(%9 'jz' 'jnz' 'jc' 'jnc')
+
+
+// ---------------------------------------------------------------------------
+// Consecutive zero-load collapse
+// mov Rn,#0x00 / mov Rm,#0x00 -> clr a / mov Rn,a / mov Rm,a
+// Saves 1 byte per pair. 96 hits, 14/17 projects.
+// rtrack normally does this but only when A is already known to be 0.
+// This rule creates the clr a that rtrack couldn't.
+// Odd-count chains leave one mov Rn,#0x00 - retrack picks it up
+// (rtrack sees A=0 from clr a, replaces consecutive chain of mov Rn,#0x00 with mov Rn,a).
+// ---------------------------------------------------------------------------
+
+replace retrack restart {
+	mov	%1,#0x00
+	mov	%2,#0x00
+} by {
+	;	<rule 1013 consecutive zero-load collapsed via clr a>
+	clr	a
+	mov	%1,a
+	mov	%2,a
+} if notUsed('a'), notSame(%1 'a' 'acc' %2)
+
+// ---------------------------------------------------------------------------
+// Dead zero-extend NOP (5-instruction variant)
+// mov tmp,#0x00; mov a,src; orl dest,a; mov a,tmp; orl dest2,a
+// mov a,tmp loads 0, orl dest2,0 is NOP, mov tmp,#0x00 feeds only this.
+// Extends rule 1009 with an extra mov a,%4 before the orl.
+// 12 hits.
+// ---------------------------------------------------------------------------
+
+replace {
+	mov	%1,#0x00
+	mov	a,%4
+	orl	%2,a
+	mov	a,%1
+	orl	%3,a
+} by {
+	;	<rule 1009b dead zero-extend OR removed (5-instr)>
+	mov	a,%4
+	orl	%2,a
+} if notUsed(%1 'a'), notSame(%1 'a' 'acc' %2 %4)
+
+// AND variant - anl with zero clears target (not NOP like orl).
+// Replace mov a,%1 (=0) with clr a, remove mov %1,#0x00.
+// 1 hit in ch554_sdcc.
+replace {
+	mov	%1,#0x00
+	mov	a,%4
+	anl	%2,a
+	mov	a,%1
+	anl	%3,a
+} by {
+	;	<rule 1009c dead zero-extend AND simplified>
+	mov	a,%4
+	anl	%2,a
+	clr	a
+	anl	%3,a
+} if notUsed(%1), notSame(%1 'a' 'acc' %2 %3 %4)
+
+// ---------------------------------------------------------------------------
+// Redundant clr a in zero-store sequence (DISABLED)
+// A=0 from clr a, movx and mov dptr don't modify A, so second clr a is dead.
+// 15 hits across 3 projects.
+// ---------------------------------------------------------------------------
+//replace {
+//	clr	a  <-- 0 matches with this instruction. TODO: rtrack fuse
+//	movx	@dptr,a
+//	mov	dptr,%1
+//	clr	a
+//	movx	@dptr,a
+//} by {
+//	;	<rule 1015 redundant clr a in zero-store sequence removed>
+//	clr	a
+//	movx	@dptr,a
+//	mov	dptr,%1
+//	movx	@dptr,a
+//} rtrack('a' '0')
+
+// ---------------------------------------------------------------------------
+// Redundant DPTR reload after read-modify-write
+// mov dptr / movx a,@dptr / orl|anl / movx @dptr,a / mov dptr (same)
+// movx @dptr,a doesn't modify dptr, so last reload is dead.
+// 6 hits in ch552_usb_knob. %9 wildcard matches orl/anl/xrl.
+// ---------------------------------------------------------------------------
+
+replace {
+	mov	dptr,%1
+	movx	a,@dptr
+	%9	%2,%3
+	movx	@dptr,a
+	mov	dptr,%1
+} by {
+	;	<rule 1016 redundant dptr reload after RMW removed>
+	mov	dptr,%1
+	movx	a,@dptr
+	%9	%2,%3
+	movx	@dptr,a
+} if same(%9 'orl' 'anl' 'xrl'), notSame(%2 'dpl' 'dph')
+
+// ---------------------------------------------------------------------------
+// Redundant DPTR reload after read + save + modify
+// mov dptr / movx a,@dptr / mov Rn,a / dec Rn / mov dptr (same)
+// dptr unchanged through mov+dec. 3 hits, 1/17 projects.
+// ---------------------------------------------------------------------------
+
+replace {
+	mov	dptr,%1
+	movx	a,@dptr
+	mov	%2,a
+	dec	%2
+	mov	dptr,%1
+} by {
+	;	<rule 1017a redundant dptr reload after read+save+dec removed>
+	mov	dptr,%1
+	movx	a,@dptr
+	mov	%2,a
+	dec	%2
+} if notSame(%2 'dpl' 'dph')
+
+// read + orl variant. 3 hits in ch552_usb_knob.
+replace {
+	mov	dptr,%1
+	movx	a,@dptr
+	orl	%2,a
+	mov	dptr,%1
+} by {
+	;	<rule 1017b redundant dptr reload after read+orl removed>
+	mov	dptr,%1
+	movx	a,@dptr
+	orl	%2,a
+} if notSame(%2 'dpl' 'dph')
+
+// ---------------------------------------------------------------------------
+// mul ab by power-of-2 strength reduction
+// mov b,#N / mul ab -> add a,acc chain. Saves 2 bytes per hit.
+// 0 hits in 17-project corpus (B and CY always live after mul).
+// notUsed('b') required: mul ab sets B=high byte, add doesn't.
+// Carry: add a,acc writes CY (overflow), mul ab clears CY.
+//        Both write CY, so notUsed('c') guards the semantic difference.
+// ---------------------------------------------------------------------------
+
+replace {
+	mov	b,#0x02
+	mul	ab
+} by {
+	;	<rule 1018a mul by 2 strength-reduced to add>
+	add	a,acc
+} if notUsed('b' 'c')
+
+replace {
+	mov	b,#0x04
+	mul	ab
+} by {
+	;	<rule 1018b mul by 4 strength-reduced to shifts>
+	add	a,acc
+	add	a,acc
+} if notUsed('b' 'c')
+
+replace {
+	mov	b,#0x08
+	mul	ab
+} by {
+	;	<rule 1018c mul by 8 strength-reduced to shifts>
+	add	a,acc
+	add	a,acc
+	add	a,acc
+} if notUsed('b' 'c')
+
+// ---------------------------------------------------------------------------
+// Redundant A reload when writing same value to multiple xdata addresses
+// mov %1,a / movx @dptr,a / mov dptr,%2 / mov a,%1 / movx @dptr,a
+// movx and mov dptr don't modify A, so reload from %1 is dead.
+// 2 hits in sigrok_fx2lafw (EP2FIFOCFG + EP6FIFOCFG). - CHECKME
+// ---------------------------------------------------------------------------
+replace {
+	mov	r%1,a
+	mov	dptr,%2
+	movx	@dptr,a
+	mov	dptr,%3
+	mov	a,r%1
+	movx	@dptr,a
+} by {
+	;	<rule 1019 redundant A reload for multi-addr write removed>
+	mov	r%1,a
+	mov	dptr,%2
+	movx	@dptr,a
+	mov	dptr,%3
+	movx	@dptr,a
+}
+
