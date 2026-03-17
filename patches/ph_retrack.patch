@@ -1,0 +1,703 @@
+--- port.h	2026-03-11 09:20:48.000000000 +0100
++++ port.h	2026-03-12 17:00:00.000000000 +0100
+@@ -357,6 +357,9 @@
+   /** Try to keep track of register contents. */
+   bool (*rtrackUpdate)(const char* line);
+ 
++  /** Re-run rtrack on lineNode region after peephole replacement. */
++  void (*retrack)(lineNode **head);
++
+   /* list of keywords that are used by this
+      target (used by lexer) */
+   char **keywords;
+--- SDCCpeeph.h	2026-03-11 09:20:48.000000000 +0100
++++ SDCCpeeph.h	2026-03-12 17:00:00.000000000 +0100
+@@ -34,6 +34,8 @@
+     lineNode *replace;
+     unsigned int restart:1;
+     unsigned int barrier:1;
++    unsigned int tail:1;
++    unsigned int retrack:1;
+     char *cond;
+     hTab *vars;
+     struct peepRule *next;
+--- SDCCpeeph.c	2026-03-11 09:20:48.000000000 +0100
++++ SDCCpeeph.c	2026-03-12 17:00:00.000000000 +0100
+@@ -2602,6 +2602,119 @@
+   return (currPl->ic && currPl->ic->op != JUMPTABLE);
+ }
+ 
++/*-----------------------------------------------------------------*/
++/* parseSymAddr - parse SDCC symbolic address into (symbol, offset) */
++/*   Handles: "(_sym + 0xNN)", "0xNN", "_sym"                     */
++/*   Returns 1 on success, 0 on parse failure.                    */
++/*-----------------------------------------------------------------*/
++static int
++parseSymAddr (const char *addr, char *sym, size_t symSz, int *off)
++{
++  const char *p = addr;
++
++  *sym = '\0';
++  *off = 0;
++
++  /* skip leading whitespace and opening paren */
++  while (*p == ' ' || *p == '\t') p++;
++  int hasParen = (*p == '(');
++  if (hasParen) p++;
++  while (*p == ' ' || *p == '\t') p++;
++
++  /* pure numeric: 0xNN or decimal */
++  if ((p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) || isdigit ((unsigned char) p[0]))
++    {
++      char *end;
++      long v = strtol (p, &end, 0);
++      while (*end == ' ' || *end == '\t') end++;
++      if (hasParen && *end == ')') end++;
++      if (*end == '\0' || *end == ' ' || *end == '\t' || *end == ';')
++        {
++          *off = (int) v;
++          return 1;
++        }
++      /* not a clean numeric - fall through */
++    }
++
++  /* symbol, optionally followed by " + 0xNN" */
++  const char *symStart = p;
++  while (*p && *p != ' ' && *p != '\t' && *p != '+' && *p != '-' && *p != ')') p++;
++  size_t len = p - symStart;
++  if (len == 0 || len >= symSz) return 0;
++  memcpy (sym, symStart, len);
++  sym[len] = '\0';
++
++  /* optional offset: sign and number may be separated by whitespace */
++  while (*p == ' ' || *p == '\t') p++;
++  if (*p == '+' || *p == '-')
++    {
++      int sign = (*p == '-') ? -1 : 1;
++      p++;
++      while (*p == ' ' || *p == '\t') p++;
++      char *end;
++      long v = strtol (p, &end, 0);
++      *off = (int) (sign * v);
++      p = end;
++    }
++  while (*p == ' ' || *p == '\t') p++;
++  if (hasParen && *p == ')') p++;
++
++  return 1;
++}
++
++/*-----------------------------------------------------------------*/
++/* operandOffset - check if op1 == op2 + N (symbolic comparison)   */
++/*   Usage: operandOffset(%1 %2 N)                                 */
++/*   Parses two SDCC symbolic addresses and checks if              */
++/*   %1 == %2 + N (same symbol, offset differs by N).              */
++/*   Operands may have # prefix (stripped automatically).           */
++/*-----------------------------------------------------------------*/
++FBYNAME (operandOffset)
++{
++  char *op[3] = {NULL, NULL, NULL};
++  int nOps = 0;
++
++  /* parse arguments: operand1, operand2, offset */
++  {
++    set *operands = setFromConditionArgs (cmdLine, vars);
++    const void *item;
++
++    for (item = setFirstItem (operands); item && nOps < 3; item = setNextItem (operands))
++      op[nOps++] = Safe_strdup ((const char *) item);
++    deleteSet (&operands);
++  }
++
++  if (nOps < 3 || !op[0] || !op[1] || !op[2])
++    {
++      int i; for (i = 0; i < nOps; i++) Safe_free (op[i]);
++      return FALSE;
++    }
++
++  int requestedOffset = (int) strtol (op[2], NULL, 0);
++
++  /* strip # prefix from operands if present */
++  const char *addr1 = op[0];
++  const char *addr2 = op[1];
++  if (*addr1 == '#') addr1++;
++  if (*addr2 == '#') addr2++;
++
++  /* parse both symbolic addresses */
++  char sym1[256], sym2[256];
++  int off1 = 0, off2 = 0;
++  if (!parseSymAddr (addr1, sym1, sizeof (sym1), &off1) ||
++      !parseSymAddr (addr2, sym2, sizeof (sym2), &off2))
++    {
++      int i; for (i = 0; i < 3; i++) Safe_free (op[i]);
++      return FALSE;
++    }
++
++  /* check: same symbol, off1 == off2 + requestedOffset */
++  int match = (!strcmp (sym1, sym2) && off1 == off2 + requestedOffset);
++
++  int i; for (i = 0; i < 3; i++) Safe_free (op[i]);
++  return match;
++}
++
+ static const struct ftab
+ {
+   const char *fname;
+@@ -2708,6 +2821,9 @@
+   {
+     "notInJumpTable", notInJumpTable
+   },
++  {
++    "operandOffset", operandOffset
++  },
+ };
+ 
+ /*-----------------------------------------------------------------*/
+@@ -2819,7 +2935,9 @@
+              lineNode * replace,
+              char *cond,
+              int restart,
+-             int barrier)
++             int barrier,
++             int tail,
++             int retrack)
+ {
+   peepRule *pr;
+ 
+@@ -2828,6 +2946,8 @@
+   pr->replace = replace;
+   pr->restart = restart;
+   pr->barrier = barrier;
++  pr->tail = tail;
++  pr->retrack = retrack;
+ 
+   if (cond && *cond)
+     {
+@@ -2954,28 +3074,39 @@
+   if (!*bp)
+     return;
+ 
+-  /* then look for either "restart" or '{' */
+-  while (strncmp (bp, "restart", 7) && *bp != '{' && bp)
+-    bp++;
++  /* then look for "tail", "retrack", "restart", or '{' */
++  {
++    int tail_local = 0;
++    int retrack_local = 0;
++    while (*bp && strncmp (bp, "restart", 7) && strncmp (bp, "retrack", 7) && strncmp (bp, "tail", 4) && *bp != '{')
++      bp++;
+ 
+-  /* not found */
+-  if (!*bp)
+-    {
+-      fprintf (stderr, "expected 'restart' or '{'\n");
+-      return;
+-    }
++    /* not found */
++    if (!*bp)
++      {
++        fprintf (stderr, "expected 'restart', 'retrack', 'tail', or '{'\n");
++        return;
++      }
+ 
+-  /* if brace */
+-  if (*bp == '{')
+-    bp++;
+-  else
+-    {                           /* must be restart */
+-      restart++;
+-      bp += strlen ("restart");
+-      /* look for '{' */
+-      EXPECT_CHR (bp, '{', "expected '{'\n");
+-      bp++;
+-    }
++    /* parse flags before '{' */
++    while (*bp && *bp != '{')
++      {
++        if (!strncmp (bp, "tail", 4))
++          { tail_local = 1; bp += 4; }
++        else if (!strncmp (bp, "retrack", 7))
++          { retrack_local = 1; bp += 7; }
++        else if (!strncmp (bp, "restart", 7))
++          { restart++; bp += 7; }
++        else
++          bp++;
++      }
++
++    if (!*bp)
++      {
++        fprintf (stderr, "expected '{'\n");
++        return;
++      }
++    bp++;  /* skip '{' */
+ 
+   /* skip thru all the blank space */
+   SKIP_SPACE (bp, "unexpected end of rule\n");
+@@ -3029,7 +3160,7 @@
+         }
+       *lp = '\0';
+ 
+-      newPeepRule (match, replace, lines, restart, barrier);
++      newPeepRule (match, replace, lines, restart, barrier, tail_local, retrack_local);
+     }
+   else
+     {
+@@ -3057,8 +3188,9 @@
+           fprintf (stderr, "%s\nexpected '} if ...'\n", strbuff);
+           return;
+         }
+-      newPeepRule (match, replace, NULL, restart, barrier);
++      newPeepRule (match, replace, NULL, restart, barrier, tail_local, retrack_local);
+     }
++  }  /* end tail_local scope */
+   goto top;
+ 
+ }
+@@ -3821,6 +3953,7 @@
+   lineNode *spl;
+   peepRule *pr;
+   lineNode *mtail = NULL;
++  lineNode *tailSpl = NULL;
+   bool restart, replaced;
+   unsigned long rule_application_counter = 0ul;
+ 
+@@ -3842,6 +3975,8 @@
+           if (restart && pr->barrier)
+             break;
+ 
++          tailSpl = NULL;
++
+           for (spl = *pls; spl; spl = replaced ? spl : spl->next)
+             {
+               replaced = FALSE;
+@@ -3869,25 +4004,37 @@
+               /* if it matches */
+               if (matchRule (spl, &mtail, pr, *pls))
+                 {
+-                  rule_application_counter++;
+-
+-                  /* restart at the replaced line */
+-                  replaced = TRUE;
+-
+-                  /* then replace */
+-                  if (spl == *pls)
++                  if (pr->tail)
+                     {
+-                      replaceRule (pls, mtail, pr);
+-                      spl = *pls;
++                      /* tail: remember position, keep scanning */
++                      tailSpl = spl;
+                     }
+                   else
+-                    replaceRule (&spl, mtail, pr);
+-
+-                  /* if restart rule type then
+-                     start at the top again */
+-                  if (pr->restart)
+                     {
+-                      restart = TRUE;
++                      rule_application_counter++;
++
++                      /* restart at the replaced line */
++                      replaced = TRUE;
++
++                      /* then replace */
++                      if (spl == *pls)
++                        {
++                          replaceRule (pls, mtail, pr);
++                          spl = *pls;
++                        }
++                      else
++                        replaceRule (&spl, mtail, pr);
++
++                      /* if retrack, re-run value tracking on modified region */
++                      if (pr->retrack && port->retrack)
++                        port->retrack (spl == *pls ? pls : &spl);
++
++                      /* if restart rule type then
++                         start at the top again */
++                      if (pr->restart)
++                        {
++                          restart = TRUE;
++                        }
+                     }
+                 }
+ 
+@@ -3900,6 +4047,28 @@
+ 
+               freeTrace (&_G.values);
+             }
++
++          /* tail: apply at the last matched position */
++          if (tailSpl && matchRule (tailSpl, &mtail, pr, *pls))
++            {
++              rule_application_counter++;
++              if (tailSpl == *pls)
++                replaceRule (pls, mtail, pr);
++              else
++                replaceRule (&tailSpl, mtail, pr);
++              if (pr->retrack && port->retrack)
++                port->retrack (tailSpl == *pls ? pls : &tailSpl);
++              if (pr->restart)
++                restart = TRUE;
++              tailSpl = NULL;
++              if (pr->vars)
++                {
++                  hTabDeleteAll (pr->vars);
++                  Safe_free (pr->vars);
++                  pr->vars = NULL;
++                }
++              freeTrace (&_G.values);
++            }
+         }
+     } while (restart == TRUE);
+ 
+--- mcs51/rtrack.h	2026-03-11 09:20:48.000000000 +0100
++++ mcs51/rtrack.h	2026-03-12 17:00:00.000000000 +0100
+@@ -19,6 +19,7 @@
+ -------------------------------------------------------------------------*/
+ 
+ bool _mcs51_rtrackUpdate (const char *line);
++void _mcs51_retrack (lineNode **head);
+ 
+ char * rtrackGetLit(const char *x);
+ 
+--- mcs51/rtrack.c	2026-03-11 09:20:48.000000000 +0100
++++ mcs51/rtrack.c	2026-03-12 17:00:00.000000000 +0100
+@@ -943,6 +943,94 @@
+ }
+ 
+ 
++/*-----------------------------------------------------------------*/
++/* _mcs51_retrack - re-run register tracking on lineNodes at *head  */
++/*-----------------------------------------------------------------*/
++void
++_mcs51_retrack (lineNode **head)
++{
++  lineNode *pl;
++
++  assert (genLine.lineCurr);
++
++  invalidateAll ();
++
++  for (pl = *head; pl; )
++    {
++      const char *p;
++      lineNode *next = pl->next;
++
++      assert (pl->line);
++      p = pl->line;
++      while (isspace ((unsigned char) *p))
++        p++;
++
++      /* skip empty lines, comments, debug */
++      if (!*p || *p == ';' || pl->isComment || pl->isDebug)
++        { pl = next; continue; }
++
++      /* stop at labels - state unknown from other paths */
++      if (pl->isLabel)
++        break;
++
++      /* stop at unconditional jumps, returns */
++      if (!strncmp (p, "sjmp", 4) || !strncmp (p, "ljmp", 4) ||
++          !strncmp (p, "ajmp", 4) || !strncmp (p, "ret", 3))
++        break;
++
++      /* capture genLine state before rtrackUpdate */
++      lineNode *saved = genLine.lineCurr;
++      int saved_verbose = options.verboseAsm;
++      options.verboseAsm = 0;
++      initGenLineElement ();
++
++      bool deleted = _mcs51_rtrackUpdate (p);
++
++      options.verboseAsm = saved_verbose;
++
++      if (deleted && genLine.lineCurr != saved)
++        {
++          /* rtrackUpdate emitted replacement(s) via emitcode.
++             Splice all appended nodes (saved->next .. lineCurr)
++             into the peephole list, replacing the original line. */
++          lineNode *first_new = saved->next;
++          lineNode *last_new = genLine.lineCurr;
++
++          /* rollback genLine */
++          genLine.lineCurr = saved;
++          saved->next = NULL;
++
++          /* splice chain in place of pl */
++          first_new->prev = pl->prev;
++          if (pl->prev)
++            pl->prev->next = first_new;
++          last_new->next = pl->next;
++          if (pl->next)
++            pl->next->prev = last_new;
++          if (pl == *head)
++            *head = first_new;
++
++          pl = last_new->next;
++        }
++      else if (deleted)
++        {
++          /* rtrackUpdate wants line deleted (no replacement emitted) */
++          if (pl->prev)
++            pl->prev->next = pl->next;
++          if (pl->next)
++            pl->next->prev = pl->prev;
++          if (pl == *head)
++            *head = pl->next;
++          pl = next;
++        }
++      else
++        {
++          pl = next;
++        }
++    }
++}
++
++
+ /* expects f.e. "#0x01" and returns either "#0x01"
+    if the value is not known to be within registers
+    or "a" or "r0".."r7".
+--- ds390/main.c	2026-03-11 09:20:48.000000000 +0100
++++ ds390/main.c	2026-03-12 17:00:00.000000000 +0100
+@@ -1256,6 +1256,7 @@
+   _ds390_getRegName,
+   0,
+   NULL,
++  NULL, /* retrack */
+   _ds390_keywords,
+   _ds390_genAssemblerStart,
+   NULL,                         /* no genAssemblerEnd */
+@@ -1609,6 +1610,7 @@
+   _ds390_getRegName,
+   0,
+   NULL,
++  NULL, /* retrack */
+   _tininative_keywords,
+   _tininative_genAssemblerStart,
+   _tininative_genAssemblerEnd,
+@@ -1869,6 +1871,7 @@
+   _ds390_getRegName,
+   0,
+   NULL,
++  NULL, /* retrack */
+   _ds390_keywords,
+   _ds390_genAssemblerStart,
+   NULL,                         /* no genAssemblerEnd */
+--- f8/main.c	2026-03-11 09:20:48.000000000 +0100
++++ f8/main.c	2026-03-12 17:00:00.000000000 +0100
+@@ -532,6 +532,7 @@
+   f8_getRegName,
+   0,
+   NULL,
++  NULL, /* retrack */
+   f8_keywords,
+   NULL,
+   f8_genAssemblerEnd,
+@@ -703,6 +704,7 @@
+   f8_getRegName,
+   0,
+   NULL,
++  NULL, /* retrack */
+   f8_keywords,
+   NULL,
+   f8_genAssemblerEnd,
+--- hc08/main.c	2026-03-11 09:20:48.000000000 +0100
++++ hc08/main.c	2026-03-12 17:00:00.000000000 +0100
+@@ -917,6 +917,7 @@
+   _hc08_getRegName,
+   0,
+   NULL,
++  NULL, /* retrack */
+   _hc08_keywords,
+   _hc08_genAssemblerStart,
+   _hc08_genAssemblerEnd,        /* no genAssemblerEnd */
+@@ -1067,6 +1068,7 @@
+   _hc08_getRegName,
+   0,
+   NULL,
++  NULL, /* retrack */
+   _hc08_keywords,
+   _hc08_genAssemblerStart,
+   _hc08_genAssemblerEnd,        /* no genAssemblerEnd */
+--- mos6502/main.c	2026-03-11 09:20:48.000000000 +0100
++++ mos6502/main.c	2026-03-12 17:00:00.000000000 +0100
+@@ -821,6 +821,7 @@
+     m6502_getRegName,
+     0,
+     NULL,
++    NULL, /* retrack */
+     m6502_keywords,
+     m6502_genAssemblerStart,    /* genAssemblerStart */
+     m6502_genAssemblerEnd,      /* genAssemblerEnd */
+@@ -993,6 +994,7 @@
+     m6502_getRegName,
+     0,
+     NULL,
++    NULL, /* retrack */
+     m6502_keywords,
+     m65c02_genAssemblerStart,   /* genAssemblerStart */
+     m6502_genAssemblerEnd,      /* genAssemblerEnd */
+--- pdk/main.c	2026-03-11 09:20:48.000000000 +0100
++++ pdk/main.c	2026-03-12 17:00:00.000000000 +0100
+@@ -392,6 +392,7 @@
+   pdk_getRegName,
+   0,
+   0,
++  NULL, /* retrack */
+   pdk_keywords,
+   pdk_genAssemblerStart,
+   pdk_genAssemblerEnd,
+@@ -564,6 +565,7 @@
+   pdk_getRegName,
+   0,
+   0,
++  NULL, /* retrack */
+   pdk_keywords,
+   pdk_genAssemblerStart,
+   pdk_genAssemblerEnd,
+@@ -736,6 +738,7 @@
+   pdk_getRegName,
+   0,
+   0,
++  NULL, /* retrack */
+   pdk_keywords,
+   pdk_genAssemblerStart,
+   pdk_genAssemblerEnd,
+--- pic14/main.c	2026-03-11 09:20:48.000000000 +0100
++++ pic14/main.c	2026-03-12 17:00:00.000000000 +0100
+@@ -453,6 +453,7 @@
+   _pic14_getRegName,
+   0,
+   NULL,
++  NULL, /* retrack */
+   _pic14_keywords,
+   _pic14_genAssemblerStart,
+   NULL,         /* no genAssemblerEnd */
+--- pic16/main.c	2026-03-11 09:20:48.000000000 +0100
++++ pic16/main.c	2026-03-12 17:00:00.000000000 +0100
+@@ -1400,6 +1400,7 @@
+   _pic16_getRegName,
+   0,
+   NULL,
++  NULL, /* retrack */
+   _pic16_keywords,
+   _pic16_genAssemblerStart,
+   NULL,             /* no genAssemblerEnd */
+--- stm8/main.c	2026-03-11 09:20:48.000000000 +0100
++++ stm8/main.c	2026-03-12 17:00:00.000000000 +0100
+@@ -589,6 +589,7 @@
+   stm8_getRegName,
+   0,
+   NULL,
++  NULL, /* retrack */
+   stm8_keywords,
+   NULL,
+   stm8_genAssemblerEnd,
+--- z80/main.c	2026-03-11 09:20:48.000000000 +0100
++++ z80/main.c	2026-03-12 17:00:00.000000000 +0100
+@@ -1398,6 +1398,7 @@
+   _getRegName,
+   _getRegByName,
+   NULL,
++  NULL, /* retrack */
+   _keywords,
+   _z80_genAssemblerStart,
+   NULL,                         /* no genAssemblerEnd */
+@@ -1535,6 +1536,7 @@
+   _getRegName,
+   _getRegByName,
+   NULL,
++  NULL, /* retrack */
+   _keywords,
+   _z80_genAssemblerStart,
+   NULL,                         /* no genAssemblerEnd */
+@@ -1672,6 +1674,7 @@
+   _getRegName,
+   _getRegByName,
+   NULL,
++  NULL, /* retrack */
+   _keywords,
+   _z80_genAssemblerStart,
+   NULL,                         /* no genAssemblerEnd */
+@@ -1808,6 +1811,7 @@
+   _getRegName,
+   _getRegByName,
+   NULL,
++  NULL, /* retrack */
+   _keywordsrab,
+   _z80_genAssemblerStart,
+   NULL,                         /* no genAssemblerEnd */
+@@ -1945,6 +1949,7 @@
+   _getRegName,
+   _getRegByName,
+   NULL,
++  NULL, /* retrack */
+   _keywordsrab,
+   _z80_genAssemblerStart,
+   NULL,                         /* no genAssemblerEnd */
+@@ -2082,6 +2087,7 @@
+   _getRegName,
+   _getRegByName,
+   NULL,
++  NULL, /* retrack */
+   _keywordsrab,
+   _z80_genAssemblerStart,
+   NULL,                         /* no genAssemblerEnd */
+@@ -2219,6 +2225,7 @@
+   _getRegName,
+   _getRegByName,
+   NULL,
++  NULL, /* retrack */
+   _keywordsrab,
+   _z80_genAssemblerStart,
+   NULL,                         /* no genAssemblerEnd */
+@@ -2356,6 +2363,7 @@
+   _getRegName,
+   _getRegByName,
+   NULL,
++  NULL, /* retrack */
+   _keywordsrab,
+   _z80_genAssemblerStart,
+   NULL,                         /* no genAssemblerEnd */
+@@ -2493,6 +2501,7 @@
+   _getRegName,
+   _getRegByName,
+   NULL,
++  NULL, /* retrack */
+   _keywordsrab,
+   _z80_genAssemblerStart,
+   NULL,                         /* no genAssemblerEnd */
+@@ -2632,6 +2641,7 @@
+   _getRegName,
+   _getRegByName,
+   NULL,
++  NULL, /* retrack */
+   _keywordsgb,
+   _z80_genAssemblerStart,
+   NULL,                         /* no genAssemblerEnd */
+@@ -2769,6 +2779,7 @@
+   _getRegName,
+   _getRegByName,
+   NULL,
++  NULL, /* retrack */
+   _keywordstlcs90,
+   _z80_genAssemblerStart,
+   NULL,                         /* no genAssemblerEnd */
+@@ -2906,6 +2917,7 @@
+   _getRegName,
+   _getRegByName,
+   NULL,
++  NULL, /* retrack */
+   _keywordsez80,
+   _z80_genAssemblerStart,
+   NULL,                         /* no genAssemblerEnd */
+@@ -3043,6 +3055,7 @@
+   _getRegName,
+   _getRegByName,
+   NULL,
++  NULL, /* retrack */
+   _keywords,
+   _z80_genAssemblerStart,
+   NULL,                         /* no genAssemblerEnd */
