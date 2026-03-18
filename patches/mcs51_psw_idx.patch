@@ -160,7 +160,16 @@
    ftype = OP_SYM_TYPE(IC_LEFT(pl->ic));
    if (IS_FUNCPTR (ftype))
      ftype = ftype->next;
-@@ -353,14 +370,18 @@
+@@ -242,6 +259,8 @@
+     return S4O_ABORT;
+   if (mcs51IsParmInCall (ftype, regs8051[rIdx].name))
+     return S4O_ABORT;
++  if (IFFUNC_ISNORETURN(ftype))
++    return S4O_WR_OP;
+   if (FUNC_CALLEESAVES(ftype))
+     return S4O_CONTINUE;
+   if (FUNC_ISNAKED(ftype))
+@@ -353,14 +372,18 @@
            if (findPushPop && strstr (p, "sp"))
              return S4O_ABORT;
  
@@ -186,7 +195,7 @@
                /* does opcode write to pReg? */
                if (bitVectBitValue (port->peep.getRegsWritten ((*pl)), rIdx))
                  return S4O_WR_OP;
-@@ -882,20 +903,26 @@
+@@ -882,20 +905,26 @@
    if (!strcmp (what, "acc"))
      return (mcs51notUsed ("a", endPl, head));
  

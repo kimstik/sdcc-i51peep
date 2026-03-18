@@ -401,24 +401,19 @@ replace {
 
 
 // ---------------------------------------------------------------------------
-// Consecutive zero-load collapse
-// mov Rn,#0x00 / mov Rm,#0x00 -> clr a / mov Rn,a / mov Rm,a
-// Saves 1 byte per pair. 96 hits, 14/17 projects.
-// rtrack normally does this but only when A is already known to be 0.
-// This rule creates the clr a that rtrack couldn't.
-// Odd-count chains leave one mov Rn,#0x00 - retrack picks it up
-// (rtrack sees A=0 from clr a, replaces consecutive chain of mov Rn,#0x00 with mov Rn,a).
+// Zero-load via clr a
+// mov X,#0x00 -> clr a / mov X,a (same size, but A becomes known 0).
+// retrack then converts any subsequent mov Y,#0x00 to mov Y,a (saves 1 byte
+// each), even across non-clobbering instructions between them.
 // ---------------------------------------------------------------------------
 
 replace retrack restart {
 	mov	%1,#0x00
-	mov	%2,#0x00
 } by {
-	;	<rule 1013 consecutive zero-load collapsed via clr a>
+	;	<rule 1013 zero-load collapsed via "clr a">
 	clr	a
 	mov	%1,a
-	mov	%2,a
-} if notUsed('a'), notSame(%1 'a' 'acc' %2)
+} if notUsed('a'), notSame(%1 'a' 'acc')
 
 // ---------------------------------------------------------------------------
 // Dead zero-extend NOP (5-instruction variant)

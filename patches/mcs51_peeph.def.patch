@@ -1,0 +1,126 @@
+Bugfixes for existing MCS51 peephole rules in peeph.def.
+
+CRITICAL: rule 131 - subb a,#0x01 replaced by dec without carry guard
+HIGH:     rule 265 - cpl c / mov bit,c loses carry
+HIGH:     rule 247.h - @r%4 typo, should be @r%5 (dead rule)
+HIGH:     rule 167 - cpl bit removes mov c,bit side effect
+MEDIUM:   rule 143.a - rlc->rl loses carry
+MEDIUM:   rule 143.b - rrc->rr loses carry (+ typo in comment)
+MEDIUM:   rule 174.a - subb-based dec clobbers A and C
+MEDIUM:   rule 174.b - inc clobbers neither A nor C but original does
+LOW:      rule 113.a - cjne clobbers C, setb clobbers A
+LOW:      rule 253.b - djnz clobbers A (was mov a,%1 / dec a)
+LOW:      rule 264 - cjne clobbers A
+LOW:      rule 271 - ternary rewrite clobbers A
+
+--- mcs51/peeph.def	2026-03-11 09:21:16.000000000 +0100
++++ mcs51/peeph.def	2026-03-12 17:00:00.000000000 +0100
+@@ -402,7 +402,7 @@
+ 	cjne	%1,%2,%3
+ 	setb	%4
+ %3:
+-} if labelRefCount %3 1
++} if labelRefCount(%3 1), notUsed('a' 'c')
+ 
+ replace {
+ 	clr	a
+@@ -788,7 +788,7 @@
+ 	;	Peephole 131	optimized decrement (not caring for c)
+ 	dec	%1
+ 	mov	%2,%1
+-}
++} if notUsed('a' 'c')
+ 
+ // ideally the optimizations of rules 132.x should be done in genCmpXX
+ replace {
+@@ -1004,15 +1004,15 @@
+ } by {
+ 	;	Peephole 143.a	converted rlc to rl
+ 	rl	a
+-}
++} if notUsed('c')
+ 
+ replace {
+ 	rrc	a
+ 	mov	acc.7,c
+ } by {
+-	;	Peephole 143.b	converted rrc to rc
++	;	Peephole 143.b	converted rrc to rr
+ 	rr	a
+-}
++} if notUsed('c')
+ 
+ replace {
+ 	clr	c
+@@ -1264,7 +1264,7 @@
+ } by {
+ 	;	Peephole 167	removed redundant bit moves (c not set to %1)
+ 	cpl	%1
+-}
++} if notUsed('c')
+ 
+ replace {
+ 	jnb	%1,%2
+@@ -1356,7 +1356,7 @@
+ 	mov	r%1,%2
+ 	;	Peephole 174.a	optimized decrement (acc not set to %2, flags undefined)
+ 	dec	%2
+-}
++} if notUsed('a' 'c')
+ 
+ replace {
+ 	mov	r%1,%2
+@@ -1367,7 +1367,7 @@
+ 	mov	r%1,%2
+ 	;	Peephole 174.b	optimized increment (acc not set to %2, flags undefined)
+ 	inc	%2
+-}
++} if notUsed('a' 'c')
+ 
+ replace {
+ 	mov	%1,@r%2
+@@ -3515,7 +3515,7 @@
+ 	orl	a,#%3
+ 	mov	@r%5,a
+ 	mov	r%5,#%1
+-	mov	a,@r%4
++	mov	a,@r%5
+ 	orl	a,#%4
+ 	mov	@r%5,a
+ } by {
+@@ -4006,7 +4006,7 @@
+ } by {
+ 	;	Peephole 253.b	optimized decrement with compare
+ 	djnz	%1,%2
+-} if notVolatile(%1), operandsNotRelated(%1 '@r0' '@r1')
++} if notVolatile(%1), operandsNotRelated(%1 '@r0' '@r1'), notUsed('a')
+ 
+ 
+ // applies to f.e. funptrs.c
+@@ -4912,7 +4912,7 @@
+ 	;	Peephole 264	jump optimization (acc not set)
+ 	cjne	%1,%2,%4
+ %3:
+-} if labelRefCount(%3 1), labelRefCountChange(%3 -1)
++} if labelRefCount(%3 1), labelRefCountChange(%3 -1), notUsed('a')
+ 
+ 
+ replace {
+@@ -4922,7 +4922,7 @@
+ 	;	Peephole 265	optimized mov/cpl sequence (carry differs)
+ 	cpl	c
+ 	mov	%1,c
+-} if notVolatile(%1)
++} if notVolatile(%1), notUsed('c')
+ 
+ replace {
+ 	mov	%1,c
+@@ -5009,7 +5009,7 @@
+ %1:
+ 	mov	%2,a
+ %3:
+-} if operandsNotRelated('a' 'dptr' %2), labelRefCount(%1 1), labelRefCountChange(%3 -1)
++} if operandsNotRelated('a' 'dptr' %2), labelRefCount(%1 1), labelRefCountChange(%3 -1), notUsed('a')
+ 
+ 
+ // left-shifting 8 bit to 16 bit result
