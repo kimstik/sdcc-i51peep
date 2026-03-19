@@ -4,57 +4,10 @@
 
 // ---------------------------------------------------------------------------
 // Idata post-increment/decrement collapse (DISABLED)
+// Rules 1000a-d: mov r0/r1,%1; mov a,@r0; mov r0,%1; inc/dec a; mov @r0,a
 // Already covered by upstream peephole rules 133, 134, 174.c in peeph.def.
 // Pattern never appears in 17-project corpus (0 hits).
 // ---------------------------------------------------------------------------
-
-//replace {
-//	mov	r0,%1
-//	mov	a,@r0
-//	mov	r0,%1
-//	inc	a
-//	mov	@r0,a
-//} by {
-//	;	<rule 1000a idata post-increment collapsed to inc @r0>
-//	mov	r0,%1
-//	inc	@r0
-//} if notUsed('a'), operandsLiteral(%1)
-//
-//replace {
-//	mov	r0,%1
-//	mov	a,@r0
-//	mov	r0,%1
-//	dec	a
-//	mov	@r0,a
-//} by {
-//	;	<rule 1000b idata post-decrement collapsed to dec @r0>
-//	mov	r0,%1
-//	dec	@r0
-//} if notUsed('a'), operandsLiteral(%1)
-//
-//replace {
-//	mov	r1,%1
-//	mov	a,@r1
-//	mov	r1,%1
-//	inc	a
-//	mov	@r1,a
-//} by {
-//	;	<rule 1000c idata post-increment collapsed to inc @r1>
-//	mov	r1,%1
-//	inc	@r1
-//} if notUsed('a'), operandsLiteral(%1)
-//
-//replace {
-//	mov	r1,%1
-//	mov	a,@r1
-//	mov	r1,%1
-//	dec	a
-//	mov	@r1,a
-//} by {
-//	;	<rule 1000d idata post-decrement collapsed to dec @r1>
-//	mov	r1,%1
-//	dec	@r1
-//} if notUsed('a'), operandsLiteral(%1)
 
 // ---------------------------------------------------------------------------
 // Boolean test of A into carry
@@ -291,7 +244,7 @@ replace {
 // Uses 'tail' flag: apply at last match, so chains collapse from end.
 // With 'restart', one rule handles arbitrary-length sequences.
 // Requires: sdcc_peephole_conditions.patch (adds operandOffset + tail flag)
-//
+;
 // operandOffset arg order: setFromConditionArgs uses addSetHead (LIFO),
 // so 'N' %base %target yields op[0]=target, op[1]=base, op[2]=N.
 // ---------------------------------------------------------------------------
@@ -384,7 +337,7 @@ replace {
 	mov	dptr,%1
 	movx	a,@dptr
 	%9	%2,%3
-} if same(%9 'jb' 'jnb' 'jbc' 'djnz'), notSame(%2 'dpl' 'dph' '0x82' '0x83' '130' '131')	//FEATURE request: symbol normalization
+} if same(%9 'jb' 'jnb' 'jbc' 'djnz'), notSame(%2 'dpl' 'dph' '0x82' '0x83' '130' '131')	;FEATURE request: symbol normalization
 
 // jz/jnz variant (one operand: label)
 replace {
@@ -410,7 +363,7 @@ replace {
 replace retrack restart {
 	mov	%1,#0x00
 } by {
-	;	<rule 1013 zero-load collapsed via "clr a">
+	;	<rule 1013 zero-load collapsed via clr a>
 	clr	a
 	mov	%1,a
 } if notUsed('a'), notSame(%1 'a' 'acc')
@@ -452,13 +405,11 @@ replace {
 	anl	%3,a
 } if notUsed(%1), notSame(%1 'a' 'acc' %2 %3 %4)
 
-// ---------------------------------------------------------------------------
 // Redundant clr a in zero-store sequence (DISABLED)
-// A=0 from clr a, movx and mov dptr don't modify A, so second clr a is dead.
-// 15 hits across 3 projects.
-// ---------------------------------------------------------------------------
-//replace {
-//	clr	a  <-- 0 matches with this instruction. TODO: rtrack fuse
+// Needs rtrack integration to know A=0 without matching clr a in pattern.
+// TODO: enable when rtrack('a' '0') condition is implemented.
+//r eplace {
+//	clr	a
 //	movx	@dptr,a
 //	mov	dptr,%1
 //	clr	a

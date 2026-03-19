@@ -173,7 +173,17 @@
  
    if (cond && *cond)
      {
-@@ -2954,28 +3074,39 @@
+@@ -2945,6 +3065,9 @@
+      start of a rule */
+   while (*bp && strncmp (bp, "replace", 7))
+     {
++      /* ignore text in // comments */
++      if (bp[0] == '/' && bp[1] == '/')
++        { while (*bp && *bp != '\n') bp++; continue; }
+       if (!strncmp (bp, "barrier", 7))
+         barrier = 1;
+       bp++;
+@@ -2954,28 +3077,39 @@
    if (!*bp)
      return;
  
@@ -233,7 +243,7 @@
  
    /* skip thru all the blank space */
    SKIP_SPACE (bp, "unexpected end of rule\n");
-@@ -3029,7 +3160,7 @@
+@@ -3029,7 +3163,7 @@
          }
        *lp = '\0';
  
@@ -242,7 +252,7 @@
      }
    else
      {
-@@ -3057,8 +3188,9 @@
+@@ -3057,8 +3191,9 @@
            fprintf (stderr, "%s\nexpected '} if ...'\n", strbuff);
            return;
          }
@@ -253,7 +263,7 @@
    goto top;
  
  }
-@@ -3821,6 +3953,7 @@
+@@ -3821,6 +3956,7 @@
    lineNode *spl;
    peepRule *pr;
    lineNode *mtail = NULL;
@@ -261,7 +271,7 @@
    bool restart, replaced;
    unsigned long rule_application_counter = 0ul;
  
-@@ -3842,6 +3975,8 @@
+@@ -3842,6 +3978,8 @@
            if (restart && pr->barrier)
              break;
  
@@ -270,7 +280,7 @@
            for (spl = *pls; spl; spl = replaced ? spl : spl->next)
              {
                replaced = FALSE;
-@@ -3869,25 +4004,37 @@
+@@ -3869,25 +4007,37 @@
                /* if it matches */
                if (matchRule (spl, &mtail, pr, *pls))
                  {
@@ -323,7 +333,7 @@
                      }
                  }
  
-@@ -3900,6 +4047,28 @@
+@@ -3900,6 +4050,28 @@
  
                freeTrace (&_G.values);
              }
