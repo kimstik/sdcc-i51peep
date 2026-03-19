@@ -113,6 +113,14 @@ jobs:
           cd sdcc-test/support/regression
           make test-mcs51-small
 
+      - name: Run testbench
+        if: matrix.variant == 'new_peep'
+        run: |
+          mkdir -p tb/tmp
+          export PATH="$PWD/sdcc-test/bin:$PATH"
+          sdcc-test/src/sdcc -mmcs51 --peep-asm --fverbose-asm -I sdcc-test/device/include -S -o tb/tmp/tests.asm tb/tests.c
+          bash tb/check.sh tb/tmp/tests.asm
+
   cross-win64:
     needs: build
     runs-on: ubuntu-latest
