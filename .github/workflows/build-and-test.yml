@@ -63,11 +63,12 @@ jobs:
   test:
     needs: build
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 360
     strategy:
       fail-fast: false
       matrix:
         variant: [baseline, patched, new_peep]
+        suite: [small, full]
 
     steps:
       - uses: actions/checkout@v6
@@ -108,13 +109,13 @@ jobs:
         if: matrix.variant != 'baseline'
         run: make -C sdcc-test -j$(nproc)
 
-      - name: Run MCS51 regression tests (small model)
+      - name: Run MCS51 regression tests
         run: |
           cd sdcc-test/support/regression
-          make test-mcs51-small
+          make test-mcs51${{ matrix.suite == 'small' && '-small' || '' }}
 
       - name: Run testbench
-        if: matrix.variant == 'new_peep'
+        if: matrix.variant == 'new_peep' && matrix.suite == 'small'
         run: |
           mkdir -p tb/tmp
           export PATH="$PWD/sdcc-test/bin:$PATH"
