@@ -4,6 +4,11 @@ on:
   push:
   pull_request:
   workflow_dispatch:
+    inputs:
+      full_test:
+        description: 'Run full test-mcs51 (all memory models)'
+        type: boolean
+        default: false
 
 jobs:
   build:
@@ -68,7 +73,7 @@ jobs:
       fail-fast: false
       matrix:
         variant: [baseline, patched, new_peep]
-        suite: [small, full]
+        suite: ${{ github.event.inputs.full_test == 'true' && fromJSON('["small", "full"]') || fromJSON('["small"]') }}
 
     steps:
       - uses: actions/checkout@v6
