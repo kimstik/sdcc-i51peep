@@ -181,7 +181,7 @@ replace {
 	div	ab
 	mov	%3,a
 	mov	%4,b
-} if notSame(%3 'b')
+} if notSame(%3 'b'), operandsNotRelated(%3 %1 %2)
 
 // ---------------------------------------------------------------------------
 // Ones complement shortcut: 0xFF - x == ~x
@@ -217,7 +217,7 @@ replace {
 } by {
 	;	<rule 1009 dead zero-extend OR removed>
 	orl	%2,a
-} if notUsed(%1 'a'), notSame(%1 %2), notSame(%1 'a' 'acc')
+} if notUsed(%1 'a'), notSame(%1 %2), notSame(%1 'a' 'acc'), notVolatile(%3)
 
 // ---------------------------------------------------------------------------
 // Bit-mask OR merge via register
@@ -386,7 +386,7 @@ replace {
 	;	<rule 1009b dead zero-extend OR removed (5-instr)>
 	mov	a,%4
 	orl	%2,a
-} if notUsed(%1 'a'), notSame(%1 'a' 'acc' %2 %4)
+} if notUsed(%1 'a'), notSame(%1 'a' 'acc' %2 %4), notVolatile(%3)
 
 // AND variant - anl with zero clears target (not NOP like orl).
 // Replace mov a,%1 (=0) with clr a, remove mov %1,#0x00.
