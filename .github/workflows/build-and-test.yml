@@ -100,6 +100,7 @@ jobs:
           applied=0
           for p in patches/*.patch; do
             [ -f "$p" ] || continue
+            case "$(basename "$p")" in *sdccman*) echo "skip doc patch (not built here): $p"; continue;; esac
             echo "Applying $p"
             patch -d sdcc-test/src -p0 < "$p"
             applied=$((applied + 1))
@@ -180,6 +181,7 @@ jobs:
         run: |
           for p in patches/*.patch; do
             [ -f "$p" ] || continue
+            case "$(basename "$p")" in *sdccman*) echo "skip doc patch (not built here): $p"; continue;; esac
             echo "Applying $p"
             patch -d sdcc-cross/src -p0 < "$p"
           done
@@ -262,6 +264,7 @@ jobs:
         run: |
           for p in patches/*.patch; do
             [ -f "$p" ] || continue
+            case "$(basename "$p")" in *sdccman*) continue;; esac
             patch -d sdcc-build/src -p0 < "$p"
           done
 
