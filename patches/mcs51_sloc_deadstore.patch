@@ -1,0 +1,110 @@
+mcs51 peephole: let notUsed() prove a dead store to a spill location
+
+The mcs51 peephole liveness check (mcs51notUsed -> scan4op/removeDeadMove)
+is register-index based and rejects any operand that is not a machine
+register, conservatively reporting it as used.  A compiler-generated
+spill location (name contains "sloc") is a function-local temporary, so
+a store to it is dead once the function returns.  Add a small, self
+contained forward scan for that case only: it is gated on spill
+locations (for globals/SFRs "dead at return" would be wrong) and is
+conservative on any read, label, call, jump or inline assembler.  This
+is deliberately separate from the register-index scanner so it cannot
+affect existing register liveness.  Enables rule 1006 (dead carry store
+before a boolean rlc) to fire.
+
+	* src/mcs51/peep.c (mcs51DeadSpillStore): New.
+	(mcs51notUsed): Fall back to it for non-register operands instead of
+	assuming used.
+
+--- mcs51/peep.c	2026-03-11 09:21:16.000000000 +0100
++++ mcs51/peep.c	2026-03-12 17:00:00.000000000 +0100
+@@ -892,6 +892,80 @@
+ /*-----------------------------------------------------------------*/
+ /* mcs51notUsed - Check that 'what' is never read after 'endPl'.   */
+ /*-----------------------------------------------------------------*/
++/*-----------------------------------------------------------------*/
++/* mcs51DeadSpillStore - is a store to spill-location 'what' dead?  */
++/*   'what' is a named operand the register tracker cannot index    */
++/*   (e.g. a bit or direct spill location).  A spill location is a  */
++/*   function-local temporary, so a store to it is dead once the    */
++/*   function returns.  Only spill locations qualify: for globals   */
++/*   or SFRs 'dead at return' would be wrong, so return false.      */
++/*   Conservative: any read/mention, label, call, jump or inline    */
++/*   assembler before a return yields false (assume used).          */
++/*-----------------------------------------------------------------*/
++static bool
++mcs51DeadSpillStore (const char *what, lineNode *endPl)
++{
++  size_t whatLen;
++  lineNode *pl;
++
++  /* Only compiler-generated spill locations qualify: their name has the
++     form "..._slocN_...".  A store to a spill location (a function-local
++     temporary) is dead once the function returns; for a global or SFR that
++     would be wrong, so anything else stays conservatively "used". */
++  {
++    const char *s = strstr (what, "sloc");
++    if (!s || !isdigit ((unsigned char) s[4]))
++      return false;
++  }
++
++  whatLen = strlen (what);
++
++  for (pl = endPl->next; pl; pl = pl->next)
++    {
++      const char *p, *m;
++
++      if (!pl->line || pl->isComment || pl->isDebug)
++        continue;
++
++      /* cannot reason across inline asm or a label (control-flow join) */
++      if (pl->isInline || pl->isLabel)
++        return false;
++
++      p = pl->line;
++      while (isspace ((unsigned char) *p))
++        p++;
++
++      /* function return: a function-local spill store is dead here */
++      if (!strncmp (p, "ret", 3))
++        return true;
++
++      /* calls and jumps: control flow leaves the linear region */
++      if (!strncmp (p, "lcall", 5) || !strncmp (p, "acall", 5) ||
++          !strncmp (p, "ljmp", 4)  || !strncmp (p, "ajmp", 4)  ||
++          !strncmp (p, "sjmp", 4)  || !strncmp (p, "jmp", 3)   ||
++          !strncmp (p, "jbc", 3)   || !strncmp (p, "jnb", 3)   ||
++          !strncmp (p, "jb", 2)    || !strncmp (p, "jnc", 3)   ||
++          !strncmp (p, "jc", 2)    || !strncmp (p, "jnz", 3)   ||
++          !strncmp (p, "jz", 2)    || !strncmp (p, "cjne", 4)  ||
++          !strncmp (p, "djnz", 4))
++        return false;
++
++      /* any whole-token mention of the spill location -> assume used */
++      for (m = pl->line; (m = strstr (m, what)); m += whatLen)
++        {
++          char before = (m == pl->line) ? ' ' : m[-1];
++          char after  = m[whatLen];
++          bool bWord = (before == '_' || isalnum ((unsigned char) before));
++          bool aWord = (after  == '_' || isalnum ((unsigned char) after));
++          if (!bWord && !aWord)
++            return false;
++        }
++    }
++
++  /* fell off the end without an explicit return: be conservative */
++  return false;
++}
++
+ bool
+ mcs51notUsed (const char *what, lineNode *endPl, lineNode *head)
+ {
+@@ -923,7 +997,7 @@
+   // todo: allow a, and support it in removeDeadMove.
+   // todo: allow dpl, dph, and support it in removeDeadMove.
+   if (mcs51_regname_to_idx (pReg) < 0)
+-    return (false);
++    return (mcs51DeadSpillStore (what, endPl));
+ 
+   bool r = removeDeadMove (pReg, endPl);
+   dbglog_deadmove (printf ("  -> %d\n", r));

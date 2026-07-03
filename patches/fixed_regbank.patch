@@ -1,3 +1,22 @@
+mcs51: add --fixed-regbank to skip PSW reset in ISR prologue
+
+Every mcs51 ISR prologue emits 'mov psw,#0x00' to select register bank 0.
+When the whole program uses only the default bank (no function declared
+__using(1..3)), that store is redundant.  --fixed-regbank lets the user
+assert this invariant so the store is dropped, saving 3 bytes and 2
+cycles per interrupt.  The instruction is still emitted for any function
+whose FUNC_REGBANK is non-zero.
+
+	* src/SDCCglobl.h (struct options): New field fixedRegbank.
+	* src/SDCCmain.c (optionsTable): New option --fixed-regbank.
+	* src/SDCCerr.h (enum): New warning code W_FIXED_REGBANK_USING.
+	* src/SDCCerr.c (messages): Message text for W_FIXED_REGBANK_USING.
+	* src/mcs51/gen.c (genFunction): In the ISR prologue, skip the PSW
+	bank-select store when options.fixedRegbank is set and the function
+	uses bank 0.
+	Also emit W_FIXED_REGBANK_USING when --fixed-regbank is combined
+	with any function that uses a non-default register bank.
+
 --- SDCCglobl.h	2026-03-11 09:20:48.000000000 +0100
 +++ SDCCglobl.h	2026-03-12 17:00:00.000000000 +0100
 @@ -288,6 +288,7 @@
@@ -18,8 +37,41 @@
    {0,   "--nostdlibcall", &optimize.noStdLibCall, "Disable optimization of calls to standard library"},
    {0,   "--nooverlay", &options.noOverlay, "Disable overlaying leaf function auto variables"},
    {0,   OPTION_NO_PURITY, NULL, "Disable optimizations of pure functions"},
+--- SDCCerr.h	2026-03-11 09:20:48.000000000 +0100
++++ SDCCerr.h	2026-03-12 17:00:00.000000000 +0100
+@@ -389,6 +389,7 @@
+   W_OPTIONAL_ARITHMETIC         = 359, // pointer to _Optional could not be proven to be non-null at pointer arithmetic
+   W_NONCONST_STRINGLIT          = 360, // string literal assigned to pointer to non-const
+   W_QUALIFIED_RETURN            = 361, // qualifier on return type has no effect
++  W_FIXED_REGBANK_USING         = 362, // --fixed-regbank active but function uses a non-default register bank (__using)
+ 
+   // If you get a merge conflict here, some #pragma disable_warning in support/valdiag and support/regression will likely need to be adapted to the resolution. Check there!
+ 
+--- SDCCerr.c	2026-03-11 09:20:48.000000000 +0100
++++ SDCCerr.c	2026-03-12 17:00:00.000000000 +0100
+@@ -787,6 +787,8 @@
+      "string literal assigned to pointer to non-const", 0 },
+   {W_QUALIFIED_RETURN, ERROR_LEVEL_WARNING,
+      "qualifier on return type has no effect", 0},
++  {W_FIXED_REGBANK_USING, ERROR_LEVEL_WARNING,
++     "--fixed-regbank is active but function '%s' uses a non-default register bank (__using); this combination can corrupt registers", 0},
+ };
+ 
+ /* -------------------------------------------------------------------------------
 --- mcs51/gen.c	2026-03-11 09:20:48.000000000 +0100
 +++ mcs51/gen.c	2026-03-12 17:00:00.000000000 +0100
+@@ -4337,6 +4337,11 @@
+   char *freereg = NULL;
+   bool fReentrant = (IFFUNC_ISREENT (sym->type) || options.stackAuto);
+ 
++  /* --fixed-regbank asserts the program stays on register bank 0; warn if a
++     function selects a non-default bank via __using, which is incompatible */
++  if (options.fixedRegbank && FUNC_REGBANK (ftype))
++    werror (W_FIXED_REGBANK_USING, sym->name);
++
+   /* create the function header */
+   emitcode (";", "-----------------------------------------");
+   emitcode (";", " function %s", sym->name);
 @@ -4512,7 +4512,8 @@
        if (!switchedPSW)
          {

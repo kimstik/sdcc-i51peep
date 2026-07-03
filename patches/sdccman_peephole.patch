@@ -1,0 +1,83 @@
+Document three new mcs51 peephole optimizer features in the SDCC manual
+(doc/sdccman.lyx, section "The Peephole Optimizer").
+
+  * operandOffset - a new peephole CONDITION function. Added to the list of
+    currently-implemented conditions and given a short description: it is
+    true when two symbolic operands share a base symbol and differ by a
+    fixed byte offset (%2 == %1 + N). The offset N is written first as a
+    quoted literal, followed by the two operands.
+  * tail    - a new rule MODIFIER. Scans the whole block without replacing,
+    remembers the last match, and replaces only there so rules with
+    overlapping windows converge bottom-up. May be combined with restart.
+  * retrack - a new rule MODIFIER. After the replacement, asks the port to
+    re-run its register/value tracker over the replaced region via an
+    optional port hook; ports without the hook ignore the flag.
+
+Both modifiers are added to the rule grammar next to restart. Only the
+peephole documentation is touched; no other manual text is changed.
+
+--- doc/sdccman.lyx	2026-03-11 09:20:48.000000000 +0100
++++ doc/sdccman.lyx	2026-03-12 17:00:00.000000000 +0100
+@@ -78921,7 +78921,7 @@
+ \begin_layout Verse
+ 
+ \family typewriter
+-rule := replace [ restart ] '{' <assembly sequence> '
++rule := replace [ restart ] [ tail ] [ retrack ] '{' <assembly sequence> '
+ \backslash
+ n'
+ \begin_inset Newline newline
+@@ -79251,6 +79251,26 @@
+ \end_layout
+ 
+ \begin_layout Standard
++A rule can also be preceded by the 'tail' modifier,
++ written between the 'replace' keyword and the opening brace just like 'restart'.
++ A normal rule is applied at the first match found while scanning the block from the top;
++ a 'tail' rule instead scans the whole block without replacing,
++ remembers the last position at which the pattern matched,
++ and performs the replacement only there.
++ This lets a rule whose match windows overlap converge from the bottom up,
++ and the 'tail' modifier can be combined with 'restart'.
++\end_layout
++
++\begin_layout Standard
++The 'retrack' modifier,
++ also written between the 'replace' keyword and the opening brace,
++ asks the port to re-run its register and value tracker over the replaced region after the replacement has been made,
++ so that the port can then find further simplifications.
++ It relies on an optional port hook;
++ ports that do not implement the hook ignore the flag.
++\end_layout
++
++\begin_layout Standard
+ A conditional function can be attached to a rule.
+  Attaching rules are somewhat more involved,
+  let's illustrate this with an example.
+@@ -79360,7 +79380,8 @@
+  operandsLiteral,
+  labelIsUncondJump,
+  deadMove,
+- useAcallAjmp
++ useAcallAjmp,
++ operandOffset
+ \emph default
+  and 
+ \emph on
+@@ -79368,6 +79389,16 @@
+ \end_layout
+ 
+ \begin_layout Standard
++The 'operandOffset' condition tests whether two symbolic operands refer to the same base symbol with addresses that differ by a fixed number of bytes.
++ It is written operandOffset('N' %1 %2) and is true when %2 equals %1 + N,
++ which is useful for recognizing sequential memory accesses,
++ for example a second 'mov dptr,#(_sym+1)' following 'mov dptr,#_sym'.
++ Because the condition arguments are collected in last-in first-out order,
++ the byte offset N is written first as a quoted literal,
++ followed by the two operands.
++\end_layout
++
++\begin_layout Standard
+ This whole thing is a little kludgy,
+  but maybe some day SDCC will have some better means.
+  If you are looking at the 

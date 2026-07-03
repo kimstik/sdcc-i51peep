@@ -1,0 +1,26 @@
+mcs51 peephole: ignore // comments when scanning for the next rule
+
+readRules() scans raw text for the tokens "replace" and "barrier" to
+find the start of the next rule.  A comment between rules that contains
+either word (e.g. "// this barrier is needed because ...") confuses the
+scanner: it can set the barrier flag spuriously or treat the comment as
+the start of a rule.
+
+Real-world peephole files use // comments between rules, so skip the
+rest of the line when // is seen during the token scan.
+
+Part of a series splitting a larger mcs51 peephole set into independent
+pieces.
+
+--- SDCCpeeph.c	2026-03-11 09:20:48.000000000 +0100
++++ SDCCpeeph.c	2026-03-12 17:00:00.000000000 +0100
+@@ -2945,6 +2945,9 @@
+      start of a rule */
+   while (*bp && strncmp (bp, "replace", 7))
+     {
++      /* ignore text in // comments */
++      if (bp[0] == '/' && bp[1] == '/')
++        { while (*bp && *bp != '\n') bp++; continue; }
+       if (!strncmp (bp, "barrier", 7))
+         barrier = 1;
+       bp++;

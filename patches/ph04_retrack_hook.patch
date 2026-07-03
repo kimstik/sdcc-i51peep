@@ -1,3 +1,35 @@
+mcs51 peephole: add the 'retrack' port hook and rule modifier
+
+A peephole replacement invalidates the register-tracking state the code
+generator built for the replaced region.  A rule marked 'retrack'
+(written between "replace" and '{', like "restart") asks the port to
+re-run its register tracker over that region right after the
+replacement, so later rules can act on the refreshed state.
+
+This is what makes mcs51 rule 1013 profitable: rewriting 'mov %1,#0x00'
+into 'clr a' / 'mov %1,a' pays off only because the following rtrack
+pass then knows a holds 0x00 and turns later #0x00 loads into the
+shorter register form.
+
+Implementation:
+  - Like the existing optional PORT peephole hooks canJoinRegs and
+    canSplitReg, the hook is NULL for ports that do not implement it.
+    PORT initialization is positional, so every initializer gains the
+    slot (ds390 x3, f8 x2, hc08 x2, mos6502 x2, pdk x3, pic14, pic16,
+    stm8, z80 x13); only mcs51 provides an implementation.
+  - _mcs51_retrack (rtrack.c) walks the lineNode region at *head, feeds
+    each line to _mcs51_rtrackUpdate with comment generation suppressed,
+    and splices any replacement lines emitted via emitcode back into the
+    peephole list.  It stops at labels, unconditional jumps and returns,
+    where the tracked state would no longer hold.
+  - In SDCCpeeph.c the flag parser gains the 'retrack' keyword, struct
+    peepRule gains a retrack:1 bit carried through newPeepRule, and the
+    shared applyRule helper calls the hook after replaceRule on both the
+    first-match and tail paths.
+
+Part of a series splitting a larger mcs51 peephole set into
+independent pieces.
+
 --- port.h	2026-03-11 09:20:48.000000000 +0100
 +++ port.h	2026-03-12 17:00:00.000000000 +0100
 @@ -357,6 +357,9 @@
@@ -12,356 +44,110 @@
    char **keywords;
 --- SDCCpeeph.h	2026-03-11 09:20:48.000000000 +0100
 +++ SDCCpeeph.h	2026-03-12 17:00:00.000000000 +0100
-@@ -34,6 +34,8 @@
-     lineNode *replace;
+@@ -35,6 +35,7 @@
      unsigned int restart:1;
      unsigned int barrier:1;
-+    unsigned int tail:1;
+     unsigned int tail:1;
 +    unsigned int retrack:1;
      char *cond;
      hTab *vars;
      struct peepRule *next;
 --- SDCCpeeph.c	2026-03-11 09:20:48.000000000 +0100
 +++ SDCCpeeph.c	2026-03-12 17:00:00.000000000 +0100
-@@ -2602,6 +2602,119 @@
-   return (currPl->ic && currPl->ic->op != JUMPTABLE);
- }
- 
-+/*-----------------------------------------------------------------*/
-+/* parseSymAddr - parse SDCC symbolic address into (symbol, offset) */
-+/*   Handles: "(_sym + 0xNN)", "0xNN", "_sym"                     */
-+/*   Returns 1 on success, 0 on parse failure.                    */
-+/*-----------------------------------------------------------------*/
-+static int
-+parseSymAddr (const char *addr, char *sym, size_t symSz, int *off)
-+{
-+  const char *p = addr;
-+
-+  *sym = '\0';
-+  *off = 0;
-+
-+  /* skip leading whitespace and opening paren */
-+  while (*p == ' ' || *p == '\t') p++;
-+  int hasParen = (*p == '(');
-+  if (hasParen) p++;
-+  while (*p == ' ' || *p == '\t') p++;
-+
-+  /* pure numeric: 0xNN or decimal */
-+  if ((p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) || isdigit ((unsigned char) p[0]))
-+    {
-+      char *end;
-+      long v = strtol (p, &end, 0);
-+      while (*end == ' ' || *end == '\t') end++;
-+      if (hasParen && *end == ')') end++;
-+      if (*end == '\0' || *end == ' ' || *end == '\t' || *end == ';')
-+        {
-+          *off = (int) v;
-+          return 1;
-+        }
-+      /* not a clean numeric - fall through */
-+    }
-+
-+  /* symbol, optionally followed by " + 0xNN" */
-+  const char *symStart = p;
-+  while (*p && *p != ' ' && *p != '\t' && *p != '+' && *p != '-' && *p != ')') p++;
-+  size_t len = p - symStart;
-+  if (len == 0 || len >= symSz) return 0;
-+  memcpy (sym, symStart, len);
-+  sym[len] = '\0';
-+
-+  /* optional offset: sign and number may be separated by whitespace */
-+  while (*p == ' ' || *p == '\t') p++;
-+  if (*p == '+' || *p == '-')
-+    {
-+      int sign = (*p == '-') ? -1 : 1;
-+      p++;
-+      while (*p == ' ' || *p == '\t') p++;
-+      char *end;
-+      long v = strtol (p, &end, 0);
-+      *off = (int) (sign * v);
-+      p = end;
-+    }
-+  while (*p == ' ' || *p == '\t') p++;
-+  if (hasParen && *p == ')') p++;
-+
-+  return 1;
-+}
-+
-+/*-----------------------------------------------------------------*/
-+/* operandOffset - check if op1 == op2 + N (symbolic comparison)   */
-+/*   Usage: operandOffset(%1 %2 N)                                 */
-+/*   Parses two SDCC symbolic addresses and checks if              */
-+/*   %1 == %2 + N (same symbol, offset differs by N).              */
-+/*   Operands may have # prefix (stripped automatically).           */
-+/*-----------------------------------------------------------------*/
-+FBYNAME (operandOffset)
-+{
-+  char *op[3] = {NULL, NULL, NULL};
-+  int nOps = 0;
-+
-+  /* parse arguments: operand1, operand2, offset */
-+  {
-+    set *operands = setFromConditionArgs (cmdLine, vars);
-+    const void *item;
-+
-+    for (item = setFirstItem (operands); item && nOps < 3; item = setNextItem (operands))
-+      op[nOps++] = Safe_strdup ((const char *) item);
-+    deleteSet (&operands);
-+  }
-+
-+  if (nOps < 3 || !op[0] || !op[1] || !op[2])
-+    {
-+      int i; for (i = 0; i < nOps; i++) Safe_free (op[i]);
-+      return FALSE;
-+    }
-+
-+  int requestedOffset = (int) strtol (op[2], NULL, 0);
-+
-+  /* strip # prefix from operands if present */
-+  const char *addr1 = op[0];
-+  const char *addr2 = op[1];
-+  if (*addr1 == '#') addr1++;
-+  if (*addr2 == '#') addr2++;
-+
-+  /* parse both symbolic addresses */
-+  char sym1[256], sym2[256];
-+  int off1 = 0, off2 = 0;
-+  if (!parseSymAddr (addr1, sym1, sizeof (sym1), &off1) ||
-+      !parseSymAddr (addr2, sym2, sizeof (sym2), &off2))
-+    {
-+      int i; for (i = 0; i < 3; i++) Safe_free (op[i]);
-+      return FALSE;
-+    }
-+
-+  /* check: same symbol, off1 == off2 + requestedOffset */
-+  int match = (!strcmp (sym1, sym2) && off1 == off2 + requestedOffset);
-+
-+  int i; for (i = 0; i < 3; i++) Safe_free (op[i]);
-+  return match;
-+}
-+
- static const struct ftab
- {
-   const char *fname;
-@@ -2708,6 +2821,9 @@
-   {
-     "notInJumpTable", notInJumpTable
-   },
-+  {
-+    "operandOffset", operandOffset
-+  },
- };
- 
- /*-----------------------------------------------------------------*/
-@@ -2819,7 +2935,9 @@
-              lineNode * replace,
+@@ -2971,7 +2971,8 @@
               char *cond,
               int restart,
--             int barrier)
-+             int barrier,
+              int barrier,
+-             int tail)
 +             int tail,
 +             int retrack)
  {
    peepRule *pr;
  
-@@ -2828,6 +2946,8 @@
-   pr->replace = replace;
+@@ -2981,6 +2982,7 @@
    pr->restart = restart;
    pr->barrier = barrier;
-+  pr->tail = tail;
+   pr->tail = tail;
 +  pr->retrack = retrack;
  
    if (cond && *cond)
      {
-@@ -2945,6 +3065,9 @@
+@@ -3079,7 +3081,7 @@
+ static void
+ readRules (const char *bp)
+ {
+-  char restart = 0, barrier = 0, tail = 0;
++  char restart = 0, barrier = 0, tail = 0, retrack = 0;
+   char lines[MAX_PATTERN_LEN];
+   size_t safetycounter;
+   char *lp;
+@@ -3094,6 +3096,7 @@
+   restart = 0;
+   barrier = 0;
+   tail = 0;
++  retrack = 0;
+ 
+   /* look for the token "replace" that is the
       start of a rule */
-   while (*bp && strncmp (bp, "replace", 7))
-     {
-+      /* ignore text in // comments */
-+      if (bp[0] == '/' && bp[1] == '/')
-+        { while (*bp && *bp != '\n') bp++; continue; }
-       if (!strncmp (bp, "barrier", 7))
-         barrier = 1;
-       bp++;
-@@ -2954,28 +3077,39 @@
+@@ -3111,14 +3114,14 @@
    if (!*bp)
      return;
  
--  /* then look for either "restart" or '{' */
--  while (strncmp (bp, "restart", 7) && *bp != '{' && bp)
--    bp++;
-+  /* then look for "tail", "retrack", "restart", or '{' */
-+  {
-+    int tail_local = 0;
-+    int retrack_local = 0;
-+    while (*bp && strncmp (bp, "restart", 7) && strncmp (bp, "retrack", 7) && strncmp (bp, "tail", 4) && *bp != '{')
-+      bp++;
+-  /* then look for a rule flag ("restart", "tail") or '{' */
+-  while (*bp && strncmp (bp, "restart", 7) && strncmp (bp, "tail", 4) && *bp != '{')
++  /* then look for a rule flag ("restart", "retrack", "tail") or '{' */
++  while (*bp && strncmp (bp, "restart", 7) && strncmp (bp, "retrack", 7) && strncmp (bp, "tail", 4) && *bp != '{')
+     bp++;
  
--  /* not found */
--  if (!*bp)
--    {
--      fprintf (stderr, "expected 'restart' or '{'\n");
--      return;
--    }
-+    /* not found */
-+    if (!*bp)
-+      {
-+        fprintf (stderr, "expected 'restart', 'retrack', 'tail', or '{'\n");
-+        return;
-+      }
+   /* not found */
+   if (!*bp)
+     {
+-      fprintf (stderr, "expected 'restart', 'tail', or '{'\n");
++      fprintf (stderr, "expected 'restart', 'retrack', 'tail', or '{'\n");
+       return;
+     }
  
--  /* if brace */
--  if (*bp == '{')
--    bp++;
--  else
--    {                           /* must be restart */
--      restart++;
--      bp += strlen ("restart");
--      /* look for '{' */
--      EXPECT_CHR (bp, '{', "expected '{'\n");
--      bp++;
--    }
-+    /* parse flags before '{' */
-+    while (*bp && *bp != '{')
-+      {
-+        if (!strncmp (bp, "tail", 4))
-+          { tail_local = 1; bp += 4; }
-+        else if (!strncmp (bp, "retrack", 7))
-+          { retrack_local = 1; bp += 7; }
-+        else if (!strncmp (bp, "restart", 7))
-+          { restart++; bp += 7; }
-+        else
-+          bp++;
-+      }
-+
-+    if (!*bp)
-+      {
-+        fprintf (stderr, "expected '{'\n");
-+        return;
-+      }
-+    bp++;  /* skip '{' */
- 
-   /* skip thru all the blank space */
-   SKIP_SPACE (bp, "unexpected end of rule\n");
-@@ -3029,7 +3163,7 @@
+@@ -3130,6 +3133,11 @@
+           restart++;
+           bp += 7;
+         }
++      else if (!strncmp (bp, "retrack", 7))
++        {
++          retrack = 1;
++          bp += 7;
++        }
+       else if (!strncmp (bp, "tail", 4))
+         {
+           tail = 1;
+@@ -3199,7 +3207,7 @@
          }
        *lp = '\0';
  
--      newPeepRule (match, replace, lines, restart, barrier);
-+      newPeepRule (match, replace, lines, restart, barrier, tail_local, retrack_local);
+-      newPeepRule (match, replace, lines, restart, barrier, tail);
++      newPeepRule (match, replace, lines, restart, barrier, tail, retrack);
      }
    else
      {
-@@ -3057,8 +3191,9 @@
+@@ -3227,7 +3235,7 @@
            fprintf (stderr, "%s\nexpected '} if ...'\n", strbuff);
            return;
          }
--      newPeepRule (match, replace, NULL, restart, barrier);
-+      newPeepRule (match, replace, NULL, restart, barrier, tail_local, retrack_local);
+-      newPeepRule (match, replace, NULL, restart, barrier, tail);
++      newPeepRule (match, replace, NULL, restart, barrier, tail, retrack);
      }
-+  }  /* end tail_local scope */
    goto top;
  
- }
-@@ -3821,6 +3956,7 @@
-   lineNode *spl;
-   peepRule *pr;
-   lineNode *mtail = NULL;
-+  lineNode *tailSpl = NULL;
-   bool restart, replaced;
-   unsigned long rule_application_counter = 0ul;
+@@ -4001,6 +4009,10 @@
+   else
+     replaceRule (spl, mtail, pr);
  
-@@ -3842,6 +3978,8 @@
-           if (restart && pr->barrier)
-             break;
- 
-+          tailSpl = NULL;
++  /* if retrack, re-run value tracking on modified region */
++  if (pr->retrack && port->retrack)
++    port->retrack (*spl == *pls ? pls : spl);
 +
-           for (spl = *pls; spl; spl = replaced ? spl : spl->next)
-             {
-               replaced = FALSE;
-@@ -3869,25 +4007,37 @@
-               /* if it matches */
-               if (matchRule (spl, &mtail, pr, *pls))
-                 {
--                  rule_application_counter++;
--
--                  /* restart at the replaced line */
--                  replaced = TRUE;
--
--                  /* then replace */
--                  if (spl == *pls)
-+                  if (pr->tail)
-                     {
--                      replaceRule (pls, mtail, pr);
--                      spl = *pls;
-+                      /* tail: remember position, keep scanning */
-+                      tailSpl = spl;
-                     }
-                   else
--                    replaceRule (&spl, mtail, pr);
--
--                  /* if restart rule type then
--                     start at the top again */
--                  if (pr->restart)
-                     {
--                      restart = TRUE;
-+                      rule_application_counter++;
-+
-+                      /* restart at the replaced line */
-+                      replaced = TRUE;
-+
-+                      /* then replace */
-+                      if (spl == *pls)
-+                        {
-+                          replaceRule (pls, mtail, pr);
-+                          spl = *pls;
-+                        }
-+                      else
-+                        replaceRule (&spl, mtail, pr);
-+
-+                      /* if retrack, re-run value tracking on modified region */
-+                      if (pr->retrack && port->retrack)
-+                        port->retrack (spl == *pls ? pls : &spl);
-+
-+                      /* if restart rule type then
-+                         start at the top again */
-+                      if (pr->restart)
-+                        {
-+                          restart = TRUE;
-+                        }
-                     }
-                 }
- 
-@@ -3900,6 +4050,28 @@
- 
-               freeTrace (&_G.values);
-             }
-+
-+          /* tail: apply at the last matched position */
-+          if (tailSpl && matchRule (tailSpl, &mtail, pr, *pls))
-+            {
-+              rule_application_counter++;
-+              if (tailSpl == *pls)
-+                replaceRule (pls, mtail, pr);
-+              else
-+                replaceRule (&tailSpl, mtail, pr);
-+              if (pr->retrack && port->retrack)
-+                port->retrack (tailSpl == *pls ? pls : &tailSpl);
-+              if (pr->restart)
-+                restart = TRUE;
-+              tailSpl = NULL;
-+              if (pr->vars)
-+                {
-+                  hTabDeleteAll (pr->vars);
-+                  Safe_free (pr->vars);
-+                  pr->vars = NULL;
-+                }
-+              freeTrace (&_G.values);
-+            }
-         }
-     } while (restart == TRUE);
- 
+   /* if restart rule type then
+      start at the top again */
+   if (pr->restart)
 --- mcs51/rtrack.h	2026-03-11 09:20:48.000000000 +0100
 +++ mcs51/rtrack.h	2026-03-12 17:00:00.000000000 +0100
 @@ -19,6 +19,7 @@
@@ -469,9 +255,19 @@
  /* expects f.e. "#0x01" and returns either "#0x01"
     if the value is not known to be within registers
     or "a" or "r0".."r7".
+--- mcs51/main.c	2026-03-11 09:20:48.000000000 +0100
++++ mcs51/main.c	2026-03-12 17:00:00.000000000 +0100
+@@ -1085,6 +1085,7 @@
+   _mcs51_getRegName,
+   0,
+   _mcs51_rtrackUpdate,
++  _mcs51_retrack,
+   _mcs51_keywords,
+   _mcs51_genAssemblerStart,
+   NULL,                         /* no genAssemblerEnd */
 --- ds390/main.c	2026-03-11 09:20:48.000000000 +0100
 +++ ds390/main.c	2026-03-12 17:00:00.000000000 +0100
-@@ -1256,6 +1256,7 @@
+@@ -1257,6 +1257,7 @@
    _ds390_getRegName,
    0,
    NULL,
@@ -479,7 +275,7 @@
    _ds390_keywords,
    _ds390_genAssemblerStart,
    NULL,                         /* no genAssemblerEnd */
-@@ -1609,6 +1610,7 @@
+@@ -1610,6 +1611,7 @@
    _ds390_getRegName,
    0,
    NULL,
@@ -487,7 +283,7 @@
    _tininative_keywords,
    _tininative_genAssemblerStart,
    _tininative_genAssemblerEnd,
-@@ -1869,6 +1871,7 @@
+@@ -1870,6 +1872,7 @@
    _ds390_getRegName,
    0,
    NULL,
@@ -533,7 +329,7 @@
    _hc08_genAssemblerEnd,        /* no genAssemblerEnd */
 --- mos6502/main.c	2026-03-11 09:20:48.000000000 +0100
 +++ mos6502/main.c	2026-03-12 17:00:00.000000000 +0100
-@@ -821,6 +821,7 @@
+@@ -801,6 +801,7 @@
      m6502_getRegName,
      0,
      NULL,
@@ -541,7 +337,7 @@
      m6502_keywords,
      m6502_genAssemblerStart,    /* genAssemblerStart */
      m6502_genAssemblerEnd,      /* genAssemblerEnd */
-@@ -993,6 +994,7 @@
+@@ -973,6 +974,7 @@
      m6502_getRegName,
      0,
      NULL,

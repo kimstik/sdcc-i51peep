@@ -1,0 +1,260 @@
+mcs51 peephole: add the 'tail' rule modifier
+
+A 'tail' rule is written between "replace" and '{', like "restart".
+A normal rule replaces at the first match of a top-down scan; a tail
+rule instead scans the whole block without replacing, remembers the
+last position at which the pattern matched, and replaces only there.
+
+This matters when match windows overlap.  The mcs51 rules 1012*
+collapse two consecutive equivalent 'mov dptr' loads.  Given N such
+loads in a row, a first-match rule rewrites the topmost pair and, even
+with 'restart', keeps working at the top while the code between the
+windows has already changed shape.  The reduction has to converge from
+the bottom instead, folding the last reload into the one before it.
+'tail' with 'restart' collapses one reload per pass, from the bottom,
+until no match remains.
+
+Implementation:
+  - struct peepRule gains a tail:1 bit.
+  - readRules replaces the old "look for 'restart' or '{'" scan with a
+    loop that parses any rule flags before '{' (extensible for future
+    flags); the flag is declared next to restart and barrier.
+  - newPeepRule takes and stores the new flag.
+  - The peepHole apply sequence (application counter, head/middle
+    replaceRule, restart flag, per-match variable cleanup, value-trace
+    release) is factored into a static helper applyRule, shared by the
+    first-match and tail paths.  A tail rule only records the match
+    position during the scan; after the scan the rule is re-matched and
+    applied there.
+
+Part of a series splitting a larger mcs51 peephole set into
+independent pieces.
+
+--- SDCCpeeph.h	2026-03-11 09:20:48.000000000 +0100
++++ SDCCpeeph.h	2026-03-12 17:00:00.000000000 +0100
+@@ -34,6 +34,7 @@
+     lineNode *replace;
+     unsigned int restart:1;
+     unsigned int barrier:1;
++    unsigned int tail:1;
+     char *cond;
+     hTab *vars;
+     struct peepRule *next;
+--- SDCCpeeph.c	2026-03-11 09:20:48.000000000 +0100
++++ SDCCpeeph.c	2026-03-12 17:00:00.000000000 +0100
+@@ -2970,7 +2970,8 @@
+              lineNode * replace,
+              char *cond,
+              int restart,
+-             int barrier)
++             int barrier,
++             int tail)
+ {
+   peepRule *pr;
+ 
+@@ -2979,6 +2980,7 @@
+   pr->replace = replace;
+   pr->restart = restart;
+   pr->barrier = barrier;
++  pr->tail = tail;
+ 
+   if (cond && *cond)
+     {
+@@ -3077,7 +3079,7 @@
+ static void
+ readRules (const char *bp)
+ {
+-  char restart = 0, barrier = 0;
++  char restart = 0, barrier = 0, tail = 0;
+   char lines[MAX_PATTERN_LEN];
+   size_t safetycounter;
+   char *lp;
+@@ -3091,6 +3093,7 @@
+ top:
+   restart = 0;
+   barrier = 0;
++  tail = 0;
+ 
+   /* look for the token "replace" that is the
+      start of a rule */
+@@ -3108,29 +3111,42 @@
+   if (!*bp)
+     return;
+ 
+-  /* then look for either "restart" or '{' */
+-  while (strncmp (bp, "restart", 7) && *bp != '{' && bp)
++  /* then look for a rule flag ("restart", "tail") or '{' */
++  while (*bp && strncmp (bp, "restart", 7) && strncmp (bp, "tail", 4) && *bp != '{')
+     bp++;
+ 
+   /* not found */
+   if (!*bp)
+     {
+-      fprintf (stderr, "expected 'restart' or '{'\n");
++      fprintf (stderr, "expected 'restart', 'tail', or '{'\n");
+       return;
+     }
+ 
+-  /* if brace */
+-  if (*bp == '{')
+-    bp++;
+-  else
+-    {                           /* must be restart */
+-      restart++;
+-      bp += strlen ("restart");
+-      /* look for '{' */
+-      EXPECT_CHR (bp, '{', "expected '{'\n");
+-      bp++;
++  /* parse the flags that may precede '{' */
++  while (*bp && *bp != '{')
++    {
++      if (!strncmp (bp, "restart", 7))
++        {
++          restart++;
++          bp += 7;
++        }
++      else if (!strncmp (bp, "tail", 4))
++        {
++          tail = 1;
++          bp += 4;
++        }
++      else
++        bp++;
+     }
+ 
++  /* '{' not found */
++  if (!*bp)
++    {
++      fprintf (stderr, "expected '{'\n");
++      return;
++    }
++  bp++;
++
+   /* skip thru all the blank space */
+   SKIP_SPACE (bp, "unexpected end of rule\n");
+ 
+@@ -3183,7 +3199,7 @@
+         }
+       *lp = '\0';
+ 
+-      newPeepRule (match, replace, lines, restart, barrier);
++      newPeepRule (match, replace, lines, restart, barrier, tail);
+     }
+   else
+     {
+@@ -3211,7 +3227,7 @@
+           fprintf (stderr, "%s\nexpected '} if ...'\n", strbuff);
+           return;
+         }
+-      newPeepRule (match, replace, NULL, restart, barrier);
++      newPeepRule (match, replace, NULL, restart, barrier, tail);
+     }
+   goto top;
+ 
+@@ -3967,6 +3983,41 @@
+ */
+ 
+ /*-----------------------------------------------------------------*/
++/* applyRule - replaces a matched pattern at *spl and does the     */
++/* bookkeeping shared by all apply sites in peepHole               */
++/*-----------------------------------------------------------------*/
++static void
++applyRule (peepRule *pr, lineNode **pls, lineNode **spl, lineNode *mtail,
++           unsigned long *rule_application_counter, bool *restart)
++{
++  (*rule_application_counter)++;
++
++  /* replace at the head or in the middle of the list */
++  if (*spl == *pls)
++    {
++      replaceRule (pls, mtail, pr);
++      *spl = *pls;
++    }
++  else
++    replaceRule (spl, mtail, pr);
++
++  /* if restart rule type then
++     start at the top again */
++  if (pr->restart)
++    *restart = true;
++
++  /* tidy up the variable bindings of this match */
++  if (pr->vars)
++    {
++      hTabDeleteAll (pr->vars);
++      Safe_free (pr->vars);
++      pr->vars = NULL;
++    }
++
++  freeTrace (&_G.values);
++}
++
++/*-----------------------------------------------------------------*/
+ /* peepHole - matches & substitutes rules                          */
+ /*-----------------------------------------------------------------*/
+ void
+@@ -3975,6 +4026,7 @@
+   lineNode *spl;
+   peepRule *pr;
+   lineNode *mtail = NULL;
++  lineNode *tailSpl = NULL;
+   bool restart, replaced;
+   unsigned long rule_application_counter = 0ul;
+ 
+@@ -3996,6 +4048,8 @@
+           if (restart && pr->barrier)
+             break;
+ 
++          tailSpl = NULL;
++
+           for (spl = *pls; spl; spl = replaced ? spl : spl->next)
+             {
+               replaced = FALSE;
+@@ -4023,25 +4077,19 @@
+               /* if it matches */
+               if (matchRule (spl, &mtail, pr, *pls))
+                 {
+-                  rule_application_counter++;
+-
+-                  /* restart at the replaced line */
+-                  replaced = TRUE;
+-
+-                  /* then replace */
+-                  if (spl == *pls)
++                  if (pr->tail)
+                     {
+-                      replaceRule (pls, mtail, pr);
+-                      spl = *pls;
++                      /* tail rule: remember the match position and
++                         keep scanning for a later match */
++                      tailSpl = spl;
+                     }
+                   else
+-                    replaceRule (&spl, mtail, pr);
+-
+-                  /* if restart rule type then
+-                     start at the top again */
+-                  if (pr->restart)
+                     {
+-                      restart = TRUE;
++                      /* restart at the replaced line */
++                      replaced = TRUE;
++
++                      applyRule (pr, pls, &spl, mtail,
++                                 &rule_application_counter, &restart);
+                     }
+                 }
+ 
+@@ -4054,6 +4102,12 @@
+ 
+               freeTrace (&_G.values);
+             }
++
++          /* tail rule: apply at the last position that matched
++             during the scan */
++          if (tailSpl && matchRule (tailSpl, &mtail, pr, *pls))
++            applyRule (pr, pls, &tailSpl, mtail,
++                       &rule_application_counter, &restart);
+         }
+     } while (restart == TRUE);
+ 

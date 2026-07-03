@@ -1,3 +1,28 @@
+mcs51: track PSW flags and harden peephole liveness analysis
+
+The mcs51 peephole liveness checks (notUsed etc.) did not model the
+non-carry PSW flags (OV/AC/P/F0/F1) or several implicit register
+reads/writes, so rules could wrongly conclude a value was dead and
+miscompile.  This adds a PSW_IDX pseudo-register, remaps the
+f0/f1/ov/p/psw operand names onto it, marks jc/jnc as carry readers,
+and records the implicit PSW/DPTR/ACC effects of arithmetic, da, movc,
+movx, inc dptr and jz/jnz.  The peephole scan is hardened to treat PSW
+as always live across calls, to abort for DPL/DPH/B/A across helper and
+_Noreturn calls, and to check regsRead directly instead of a coarse
+text search.  findLabel() also accepts a space as opcode/label
+separator, fixing a "deadmove" internal error on space-separated
+inline-asm jumps.
+
+	* src/mcs51/ralloc.h, src/mcs51/ralloc.c: Add PSW_IDX pseudo-register
+	and map the PSW flag operand names onto it.
+	* src/mcs51/main.c: Register the PSW_IDX name tables.
+	* src/mcs51/peep.c (asmLineNodeFromLineNode): Record implicit PSW,
+	DPTR and ACC read/write effects.
+	(mcs51notUsed, scan logic): Treat PSW as always live; abort for
+	DPL/DPH/B/A across helper and _Noreturn calls; check regsRead
+	unconditionally.
+	(findLabel): Accept ' ' as opcode/label separator.
+
 --- mcs51/ralloc.h	2026-03-11 09:20:48.000000000 +0100
 +++ mcs51/ralloc.h	2026-03-12 17:00:00.000000000 +0100
 @@ -34,6 +34,7 @@
@@ -119,16 +144,22 @@
      }
  
    return aln;
-@@ -1084,6 +1127,7 @@
-   _mcs51_getRegName,
-   0,
-   _mcs51_rtrackUpdate,
-+  _mcs51_retrack,
-   _mcs51_keywords,
-   _mcs51_genAssemblerStart,
-   NULL,                         /* no genAssemblerEnd */
 --- mcs51/peep.c	2026-03-11 09:21:16.000000000 +0100
 +++ mcs51/peep.c	2026-03-12 17:00:00.000000000 +0100
+@@ -171,11 +171,11 @@
+   /* In each mcs51 jumping opcode the label is at the end of the opcode */
+   p = strlen (pl->line) - 1 + pl->line;
+
+-  /* scan backward until ',' or '\t' */
++  /* scan backward until ',', '\t' or ' ' */
+   for (; p > pl->line; p--)
+-    if (*p == ',' || *p == '\t')
++    if (*p == ',' || *p == '\t' || *p == ' ')
+       break;
+
+   /* sanity check */
+   if (p == pl->line)
+     {
 @@ -229,12 +229,29 @@
    sym_link *ftype;
    bool banked_reg = (rIdx == R0_IDX) || (rIdx == R1_IDX) || (rIdx == R2_IDX);
